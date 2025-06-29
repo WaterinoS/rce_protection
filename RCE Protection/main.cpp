@@ -1,9 +1,19 @@
-#include "te-sdk.h"
+#include "te-rce-protection.h"
 
-bool MyOutgoingPacketCallback(const te_sdk::PacketContext& ctx)
+bool OnIncomingRPC(const te_sdk::RpcContext& ctx)
 {
-    printf("[TEST] OUTGOING PACKET: id=%i\n", ctx.packetId);
-    return true;
+	//te_sdk::helper::logging::Log("[RCE PROTECTION] Incoming RPC: %i", ctx.rpcId);
+
+    auto validation_result = te::rce::helper::CheckRPC(ctx.rpcId, (BitStream*)ctx.bitStream);
+    if (!validation_result.empty())
+    {
+        for (const auto& message : validation_result)
+        {
+            te_sdk::helper::logging::Log("[RCE PROTECTION] %s", message.c_str());
+        }
+        return false; // Block the RPC
+    }
+    return true; // Allow the RPC
 }
 
 void Init()
@@ -13,12 +23,8 @@ void Init()
         std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 
-    //te_sdk::RegisterRaknetCallback(HookType::OutgoingPacket, MyOutgoingPacketCallback);
+    te_sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
 
-    te_sdk::RegisterRaknetCallback(HookType::IncomingRpc, [](const te_sdk::PacketContext& ctx) {     
-        // TODO RCE PROTECTION
-        return true;
-	});
 	printf("[TEST] RakNet hooks initialized.\n");
 }
 
@@ -28,11 +34,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     {
         // CONSOLE
         {
-            AllocConsole();
-            FILE* f;
-            freopen_s(&f, "CONOUT$", "w", stdout);
-            freopen_s(&f, "CONOUT$", "w", stderr);
-            freopen_s(&f, "CONIN$", "r", stdin);
+            /*
+                AllocConsole();
+                FILE* f;
+                freopen_s(&f, "CONOUT$", "w", stdout);
+                freopen_s(&f, "CONOUT$", "w", stderr);
+                freopen_s(&f, "CONIN$", "r", stdin);
+            */
         }
 
         std::thread(Init).detach();
