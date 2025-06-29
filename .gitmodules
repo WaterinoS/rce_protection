@@ -1,0 +1,3 @@
+[submodule "RCE Protection/external/te_sdk"]
+	path = RCE Protection/external/te_sdk
+	url = https://github.com/WaterinoS/te_sdk.git
