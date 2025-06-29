@@ -6,6 +6,22 @@ bool MyOutgoingPacketCallback(const te_sdk::PacketContext& ctx)
     return true;
 }
 
+void Init()
+{
+    while (!te_sdk::InitRakNetHooks())
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+	}
+
+    //te_sdk::RegisterRaknetCallback(HookType::OutgoingPacket, MyOutgoingPacketCallback);
+
+    te_sdk::RegisterRaknetCallback(HookType::IncomingRpc, [](const te_sdk::PacketContext& ctx) {     
+        // TODO RCE PROTECTION
+        return true;
+	});
+	printf("[TEST] RakNet hooks initialized.\n");
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
@@ -19,8 +35,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             freopen_s(&f, "CONIN$", "r", stdin);
         }
 
-        te_sdk::InitRakNetHooks();
-		te_sdk::RegisterRaknetCallback(HookType::OutgoingPacket, MyOutgoingPacketCallback);
+        std::thread(Init).detach();
     }
     return TRUE;
 }
