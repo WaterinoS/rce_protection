@@ -30,7 +30,6 @@
 *.lai
 *.la
 *.a
-*.lib
 
 # Executables
 *.exe
@@ -43,3 +42,4 @@
 /RCE Protection/.vs/RCE Protection
 /RCE Protection/RCE Protection/Debug
 /RCE Protection/RCE Protection/Release
+/RCE Protection/RCE Protection/x64/Debug
