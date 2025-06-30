@@ -13,5 +13,5 @@ namespace te::rce::helper
 	};
 
 	uint32_t PatternScan(uint32_t pModuleBaseAddress, const char* sSignature, bool bSkipFirst);
-	std::vector<std::string> CheckRPC(int rpcId, BitStream* bs);
+	bool CheckRPC(int rpcId, BitStream* bs);
 }

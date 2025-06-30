@@ -1,19 +1,35 @@
 #include "te-rce-protection.h"
+#include "FullRaknet/PacketEnumerations.h"
 
 bool OnIncomingRPC(const te_sdk::RpcContext& ctx)
 {
-	te_sdk::helper::logging::Log("[RCE PROTECTION] Incoming RPC: %i", ctx.rpcId);
+    return te::rce::helper::CheckRPC(ctx.rpcId, (BitStream*)ctx.bitStream);
+}
 
-    auto validation_result = te::rce::helper::CheckRPC(ctx.rpcId, (BitStream*)ctx.bitStream);
-    if (!validation_result.empty())
+bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
+{
+    if (ctx.packetId == PacketEnumeration::ID_MARKERS_SYNC)
     {
-        for (const auto& message : validation_result)
+        int				iNumberOfPlayers = 0;
+        uint16_t		playerID = uint16_t(-1);
+        short			sPos[3] = { 0, 0, 0 };
+        bool			bIsPlayerActive = false;
+
+        (*(BitStream*)ctx.bitStream).IgnoreBits(8);
+        (*(BitStream*)ctx.bitStream).Read(iNumberOfPlayers);
+        if (iNumberOfPlayers < 0 || iNumberOfPlayers >  1004/*SAMP_MAX_PLAYERS*/)
+            return false;
+
+        auto remainingSize = (*(BitStream*)ctx.bitStream).GetNumberOfUnreadBits() / 8;
+        if (remainingSize > (sizeof(uint16_t) + sizeof(bool) + 3 * sizeof(int16_t)) * iNumberOfPlayers)
         {
-            te_sdk::helper::logging::Log("[RCE PROTECTION] %s", message.c_str());
+            te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bytes, expected at most %d bytes for %d players.",
+                remainingSize, (sizeof(uint16_t) + sizeof(bool) + 3 * sizeof(int16_t)) * iNumberOfPlayers, iNumberOfPlayers);
+            return false;
         }
-        return false; // Block the RPC
-    }
-    return true; // Allow the RPC
+	}
+
+    return true;
 }
 
 void Init()
@@ -24,6 +40,7 @@ void Init()
 	}
 
     te_sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
+    te_sdk::RegisterRaknetCallback(HookType::IncomingPacket, OnIncomingPacket);
 
 	//printf("[TEST] RakNet hooks initialized.\n");
 }

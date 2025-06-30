@@ -40,6 +40,9 @@ namespace te::rce::fz::bypass
 	// Other
 	std::unordered_map<std::string, PatternData> s_patternCache;
 
+	static std::recursive_mutex g_memoryProtectionMutex;
+	static std::atomic<bool> g_isProcessingButo{ false };
+
 	static int CallOriginal(int a1)
 	{
 		int result;
@@ -49,6 +52,11 @@ namespace te::rce::fz::bypass
 			mov  result, eax
 		}
 		return result;
+	}
+
+	bool SafeVirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect) {
+		std::lock_guard<std::recursive_mutex> lock(g_memoryProtectionMutex);
+		return VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect) != FALSE;
 	}
 
 	std::string RandomHex() {
@@ -221,61 +229,74 @@ namespace te::rce::fz::bypass
 
 	std::string GenerateButoStringFromMappedMemory()
 	{
-		if (g_seedAddr == 0 || g_counterAddr == 0 || g_byteArrayAddr == 0) {
-			te_sdk::helper::logging::Log("[GenerateButoStringFromMappedMemory] Invalid pointer(s): seed=0x%X counter=0x%X array=0x%X",
-				g_seedAddr, g_counterAddr, g_byteArrayAddr);
+		// Prevent recursive calls that could cause deadlock
+		if (g_isProcessingButo.exchange(true)) {
 			return "";
 		}
 
-		uint32_t* pCounter = reinterpret_cast<uint32_t*>(g_counterAddr);
-		uint32_t* pSeed = reinterpret_cast<uint32_t*>(g_seedAddr);
-		uint8_t* byteArray = reinterpret_cast<uint8_t*>(g_byteArrayAddr);
-
-		uint32_t hFileb = *pSeed + 300;
-		uint8_t buffer[0x80] = {};
-		int v316 = 0;
-
-		while (byteArray[v316])
-			++v316;
-
-		for (int i = 0; i < v316; ++i)
-		{
-			uint8_t ch = byteArray[i];
-			uint32_t tmp = ((hFileb >> 3) + 7) ^ (33 * hFileb);
-			uint8_t mixed = (uint8_t)((tmp << 5) | (tmp >> 3));
-			uint8_t v30 = mixed ^ ch;
-			hFileb = mixed;
-
-			uint8_t v31 = (v30 << 3) | (v30 >> 5);
-			uint8_t high = (v31 >> 4) & 0xF;
-			uint8_t low = v31 & 0xF;
-
-			size_t len = strlen((char*)buffer);
-			if (len > 125) break;
-
-			buffer[len] = (high <= 9) ? (high + '0') : (high + '7');
-			buffer[len + 1] = (low <= 9) ? (low + '0') : (low + '7');
-			buffer[len + 2] = 0;
+		if (g_seedAddr == 0 || g_counterAddr == 0 || g_byteArrayAddr == 0) {
+			te_sdk::helper::logging::Log("[GenerateButoStringFromMappedMemory] Invalid pointer(s): seed=0x%X counter=0x%X array=0x%X",
+				g_seedAddr, g_counterAddr, g_byteArrayAddr);
+			g_isProcessingButo = false;
+			return "";
 		}
 
-		//te_sdk::helper::logging::Log("[BUTO] Before increment: seed=%u counter=%u", *pSeed, *pCounter);
+		try {
+			uint32_t* pCounter = reinterpret_cast<uint32_t*>(g_counterAddr);
+			uint32_t* pSeed = reinterpret_cast<uint32_t*>(g_seedAddr);
+			uint8_t* byteArray = reinterpret_cast<uint8_t*>(g_byteArrayAddr);
 
-		DWORD oldProt;
-		if (VirtualProtect(pCounter, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProt))
-		{
-			uint32_t counter = ++(*pCounter);
-			if (counter == 2)
+			uint32_t hFileb = *pSeed + 300;
+			uint8_t buffer[0x80] = {};
+			int v316 = 0;
+
+			while (byteArray[v316])
+				++v316;
+
+			for (int i = 0; i < v316; ++i)
 			{
-				VirtualProtect(pSeed, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProt);
-				++(*pSeed);
-				VirtualProtect(pSeed, sizeof(uint32_t), oldProt, &oldProt);
+				uint8_t ch = byteArray[i];
+				uint32_t tmp = ((hFileb >> 3) + 7) ^ (33 * hFileb);
+				uint8_t mixed = (uint8_t)((tmp << 5) | (tmp >> 3));
+				uint8_t v30 = mixed ^ ch;
+				hFileb = mixed;
 
-				*pCounter = 0;
+				uint8_t v31 = (v30 << 3) | (v30 >> 5);
+				uint8_t high = (v31 >> 4) & 0xF;
+				uint8_t low = v31 & 0xF;
+
+				size_t len = strlen((char*)buffer);
+				if (len > 125) break;
+
+				buffer[len] = (high <= 9) ? (high + '0') : (high + '7');
+				buffer[len + 1] = (low <= 9) ? (low + '0') : (low + '7');
+				buffer[len + 2] = 0;
 			}
-			VirtualProtect(pCounter, sizeof(uint32_t), oldProt, &oldProt);
-		}
 
-		return std::string((char*)buffer);
+			//te_sdk::helper::logging::Log("[BUTO] Before increment: seed=%u counter=%u", *pSeed, *pCounter);
+
+			DWORD oldProt;
+			if (SafeVirtualProtect(pCounter, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProt))
+			{
+				uint32_t counter = ++(*pCounter);
+				if (counter == 2)
+				{
+					SafeVirtualProtect(pSeed, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProt);
+					++(*pSeed);
+					SafeVirtualProtect(pSeed, sizeof(uint32_t), oldProt, &oldProt);
+
+					*pCounter = 0;
+				}
+				SafeVirtualProtect(pCounter, sizeof(uint32_t), oldProt, &oldProt);
+			}
+
+			g_isProcessingButo = false;
+			return std::string((char*)buffer);
+		}
+		catch (...) {
+			g_isProcessingButo = false;
+			return "";
+		}
 	}
 
 	typedef void(__cdecl* tSub6C0C12A8)(
@@ -408,15 +429,16 @@ namespace te::rce::fz::bypass
 			(DWORD)((g_HookAddress + prologueSize) - (((uintptr_t)p) + 5));
 
 		DWORD old;
-		VirtualProtect((LPVOID)g_HookAddress, 5,
-			PAGE_EXECUTE_READWRITE, &old);
+		if (!SafeVirtualProtect((LPVOID)g_HookAddress, 5, PAGE_EXECUTE_READWRITE, &old)) {
+			return false;
+		}
 		{
 			BYTE* dst = (BYTE*)g_HookAddress;
 			dst[0] = 0xE9; // JMP
 			*reinterpret_cast<DWORD*>(dst + 1) =
 				(DWORD)((uintptr_t)MySay - (g_HookAddress + 5));
 		}
-		VirtualProtect((LPVOID)g_HookAddress, 5, old, &old);
+		SafeVirtualProtect((LPVOID)g_HookAddress, 5, old, &old);
 		return true;
 	}
 
@@ -599,8 +621,9 @@ namespace te::rce::fz::bypass
 		}
 
 		DWORD oldProt;
-		VirtualProtect((void*)g_stubEP, g_stubScanSize,
-			PAGE_EXECUTE_READWRITE, &oldProt);
+		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+			return;
+		}
 
 		BYTE* p = (BYTE*)g_stubEP;
 
@@ -641,7 +664,7 @@ namespace te::rce::fz::bypass
 			}
 		}
 
-		VirtualProtect((void*)g_stubEP, g_stubScanSize, oldProt, &oldProt);
+		SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, oldProt, &oldProt);
 	}
 
 	void CallACRealDllMain()
@@ -657,7 +680,7 @@ namespace te::rce::fz::bypass
 		BYTE* addr = reinterpret_cast<BYTE*>(0x6E2E50);
 		DWORD oldProtect;
 
-		if (!VirtualProtect(addr, 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+		if (!SafeVirtualProtect(addr, 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
 			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Failed VirtualProtect on 0x6E2E50.");
 			return;
 		}
@@ -666,7 +689,7 @@ namespace te::rce::fz::bypass
 		addr[2] = 0x00;
 
 		DWORD dummy;
-		VirtualProtect(addr, 3, oldProtect, &dummy);
+		SafeVirtualProtect(addr, 3, oldProtect, &dummy);
 
 		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Simulated VirtualProtect patch at 0x6E2E50.");
 	}
@@ -794,12 +817,14 @@ namespace te::rce::fz::bypass
 						if (paramAddr == targetStartAddress)
 						{
 							DWORD oldProtect;
-							VirtualProtect(&code[i + k], 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-							memset(&code[i + k], 0x90, 5);
-							VirtualProtect(&code[i + k], 5, oldProtect, &oldProtect);
+							if (SafeVirtualProtect(&code[i + k], 5, PAGE_EXECUTE_READWRITE, &oldProtect))
+							{
+								memset(&code[i + k], 0x90, 5);
+								SafeVirtualProtect(&code[i + k], 5, oldProtect, &oldProtect);
 
-							//te_sdk::helper::logging::Log("[Patch] NOPed CreateThread call with StartAddress 0x%08X", targetStartAddress);
-							++patched;
+								//te_sdk::helper::logging::Log("[Patch] NOPed CreateThread call with StartAddress 0x%08X", targetStartAddress);
+								++patched;
+							}
 						}
 
 						break;
@@ -948,7 +973,7 @@ namespace te::rce::fz::bypass
 				return true;
 			}
 			catch (const std::exception& e) {
-				te_sdk::helper::logging::Log("Exception while saving PE executable: %s", e.what());
+				te_sdk::helper::logging::Log("Exception while processing PE executable: %s", e.what());
 			}
 		}
 

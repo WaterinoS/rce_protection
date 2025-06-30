@@ -308,16 +308,13 @@ namespace te::rce::helper
 		return 0;
 	}
 
-	std::vector<std::string> CheckRPC(int rpcId, BitStream* bs)
+	bool CheckRPC(int rpcId, BitStream* bs)
 	{
-		std::vector<std::string> output(0);
-		output.clear();
-
 		try
 		{
 			RPC* rpc = findRPCById(rpcId);
 			if (!rpc) {
-				return output;
+				return true; // Allow if RPC not found
 			}
 
 			auto numberOfBits = bs->GetNumberOfUnreadBits();
@@ -349,7 +346,7 @@ namespace te::rce::helper
 					}
 
 					if (!libraryName.empty() && !isValidText(libraryName)) {
-						output.push_back("Invalid text detected in string data");
+						return false; // Block - invalid text detected
 					}
 				}
 				else if (MaterialType == 2)
@@ -357,29 +354,25 @@ namespace te::rce::helper
 					auto maxSize = calcSize(rpc, bs);
 					if (maxSize >= 0 && numberOfBits > maxSize)
 					{
-						output.push_back("Detected possible RCE attempt (0x2)");
+						return false; // Block - possible RCE attempt
 					}
 				}
 				break;
 			case 61:
 			{
-				/*Parameters: INT16 wDialogID, UINT8 bDialogStyle, UINT8 bTitleLength, char[] szTitle, UINT8 bButton1Len, char[] szButton1, UINT8 bButton2Len, char[] szButton2, CSTRING szInfo[4096]*/
-
 				uint16_t wDialogID;
 				bs->Read(wDialogID);
 
 				auto maxSize = calcSize(rpc, bs);
 				if (maxSize >= 0 && numberOfBits > maxSize)
 				{
-					output.push_back("Detected possible RCE attempt");
-
-					if (te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC"))
+					bool hasPE = te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC");
+					if (hasPE)
 					{
-						output.push_back("Detected malicious PE executable in RPC data");
-						return output;
+						return false; // Block - malicious PE executable detected
 					}
+					return false; // Block - possible RCE attempt
 				}
-
 				break;
 			}
 			default:
@@ -387,7 +380,7 @@ namespace te::rce::helper
 				auto maxSize = calcSize(rpc, bs);
 				if (maxSize >= 0 && numberOfBits > maxSize)
 				{
-					output.push_back("Detected possible RCE attempt");
+					return false; // Block - possible RCE attempt
 				}
 				else
 				{
@@ -403,22 +396,19 @@ namespace te::rce::helper
 
 							if (!bs->ReadCompressed(dynamicString.data(), rpc->dynamicLengths[i], true))
 							{
-								// Handle read error
-								//te_sdk::helper::logging::Log("Failed to read compressed data (rpcId: %i (%s))", rpcId, rpc->name.c_str());
 								continue;
 							}
 
 							if (!dynamicString.empty() && !isValidText(dynamicString)) {
-								output.push_back("Invalid text detected in string data");
-								break;
+								return false; // Block - invalid text detected
 							}
 						}
 						else {
-							std::vector<char> buffer(stringLength + 1, '\0');  // Ensure null termination
+							std::vector<char> buffer(stringLength + 1, '\0');
 							bs->Read(buffer.data(), stringLength);
 
 							if (!buffer[0] && !isValidText(buffer.data())) {
-								output.push_back("Invalid text detected in string data");
+								return false; // Block - invalid text detected
 							}
 						}
 					}
@@ -430,8 +420,9 @@ namespace te::rce::helper
 		catch (std::exception& e)
 		{
 			te_sdk::helper::logging::Log("CheckRPC exception: %s", e.what());
+			return false; // Block on exception for safety
 		}
 
-		return output;
+		return true; // Allow the RPC
 	}
 }
