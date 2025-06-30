@@ -2,7 +2,7 @@
 
 bool OnIncomingRPC(const te_sdk::RpcContext& ctx)
 {
-	//te_sdk::helper::logging::Log("[RCE PROTECTION] Incoming RPC: %i", ctx.rpcId);
+	te_sdk::helper::logging::Log("[RCE PROTECTION] Incoming RPC: %i", ctx.rpcId);
 
     auto validation_result = te::rce::helper::CheckRPC(ctx.rpcId, (BitStream*)ctx.bitStream);
     if (!validation_result.empty())
@@ -25,7 +25,7 @@ void Init()
 
     te_sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
 
-	printf("[TEST] RakNet hooks initialized.\n");
+	//printf("[TEST] RakNet hooks initialized.\n");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
