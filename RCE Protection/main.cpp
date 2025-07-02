@@ -10,9 +10,9 @@ bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
 {
     if (ctx.packetId == PacketEnumeration::ID_MARKERS_SYNC)
     {
-        int				iNumberOfPlayers = 0;
+        uint32_t		iNumberOfPlayers = 0;
         uint16_t		playerID = uint16_t(-1);
-        short			sPos[3] = { 0, 0, 0 };
+        uint16_t		sPos[3] = { 0, 0, 0 };
         bool			bIsPlayerActive = false;
 
         (*(BitStream*)ctx.bitStream).IgnoreBits(8);
@@ -20,11 +20,12 @@ bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
         if (iNumberOfPlayers < 0 || iNumberOfPlayers >  1004/*SAMP_MAX_PLAYERS*/)
             return false;
 
-        auto remainingSize = (*(BitStream*)ctx.bitStream).GetNumberOfUnreadBits() / 8;
-        if (remainingSize > (sizeof(uint16_t) + sizeof(bool) + 3 * sizeof(int16_t)) * iNumberOfPlayers)
+        auto remainingBitsSize = (*(BitStream*)ctx.bitStream).GetNumberOfUnreadBits();
+        auto expectedMaxBitsSize = (16 + 1 + 3 * 16) * iNumberOfPlayers;
+        if (iNumberOfPlayers > 0 && remainingBitsSize > expectedMaxBitsSize)
         {
             te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bytes, expected at most %d bytes for %d players.",
-                remainingSize, (sizeof(uint16_t) + sizeof(bool) + 3 * sizeof(int16_t)) * iNumberOfPlayers, iNumberOfPlayers);
+                remainingBitsSize, (sizeof(uint16_t) + sizeof(bool) + 3 * sizeof(int16_t)) * iNumberOfPlayers, iNumberOfPlayers);
             return false;
         }
 	}
