@@ -24,8 +24,8 @@ bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
         auto expectedMaxBitsSize = (16 + 1 + 3 * 16) * iNumberOfPlayers;
         if (iNumberOfPlayers > 0 && remainingBitsSize > expectedMaxBitsSize)
         {
-            te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bytes, expected at most %d bytes for %d players.",
-                remainingBitsSize, (sizeof(uint16_t) + sizeof(bool) + 3 * sizeof(int16_t)) * iNumberOfPlayers, iNumberOfPlayers);
+            te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bits, expected at most %d bits for %d players.",
+				remainingBitsSize, expectedMaxBitsSize, iNumberOfPlayers);
             return false;
         }
 	}
