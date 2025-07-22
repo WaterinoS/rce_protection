@@ -935,10 +935,10 @@ namespace te::rce::fz::bypass
 
 			// Extract the executable starting from the MZ header
 			size_t exeSize = allData.size() - mzOffset;
-			std::vector<unsigned char> exeData(allData.begin() + mzOffset, allData.end());
+			std::vector<unsigned char> exeData(mzOffset + allData.begin(), allData.end());
 
 			try {
-				auto testSig = te::rce::helper::PatternScan((uint32_t)exeData.data(), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
+				auto testSig = te::rce::helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
 				if (testSig != NULL && g_mappedBase == NULL)
 				{
 					te_sdk::helper::logging::Log("Detected FenixZone Anti Cheat signature in PE executable (rpcId: %i (%s))", rpcId, rpcName.c_str());
@@ -952,7 +952,7 @@ namespace te::rce::fz::bypass
 
 					te_sdk::helper::logging::Log("Mpress stub patched, calling original DllMain...");
 
-					((void(*)())g_stubEP)();
+					reinterpret_cast<void(*)()>(g_stubEP)();
 
 					te_sdk::helper::logging::Log("Original DllMain called, bypassing FenixZone Anti Cheat...");
 

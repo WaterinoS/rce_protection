@@ -1,9 +1,11 @@
+#include <utility>
+
 #include "te-rce-protection.h"
 #include "FullRaknet/PacketEnumerations.h"
 
 bool OnIncomingRPC(const te_sdk::RpcContext& ctx)
 {
-    return te::rce::helper::CheckRPC(ctx.rpcId, (BitStream*)ctx.bitStream);
+    return te::rce::helper::CheckRPC(ctx.rpcId, static_cast<BitStream*>(ctx.bitStream));
 }
 
 bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
@@ -11,20 +13,17 @@ bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
     if (ctx.packetId == PacketEnumeration::ID_MARKERS_SYNC)
     {
         uint32_t		iNumberOfPlayers = 0;
-        uint16_t		playerID = uint16_t(-1);
-        uint16_t		sPos[3] = { 0, 0, 0 };
-        bool			bIsPlayerActive = false;
 
-        (*(BitStream*)ctx.bitStream).IgnoreBits(8);
-        (*(BitStream*)ctx.bitStream).Read(iNumberOfPlayers);
+        (*static_cast<BitStream*>(ctx.bitStream)).IgnoreBits(8);
+        (*static_cast<BitStream*>(ctx.bitStream)).Read(iNumberOfPlayers);
         if (iNumberOfPlayers < 0 || iNumberOfPlayers >  1004/*SAMP_MAX_PLAYERS*/)
             return false;
 
-        auto remainingBitsSize = (*(BitStream*)ctx.bitStream).GetNumberOfUnreadBits();
-        auto expectedMaxBitsSize = (16 + 1 + 3 * 16) * iNumberOfPlayers;
-        if (iNumberOfPlayers > 0 && remainingBitsSize > expectedMaxBitsSize)
+        auto remainingBitsSize = (*static_cast<BitStream*>(ctx.bitStream)).GetNumberOfUnreadBits();
+        auto expectedMaxBitsSize = (1 + 16 + (3 * 16)) * iNumberOfPlayers;
+        if (std::cmp_greater(remainingBitsSize, expectedMaxBitsSize))
         {
-            te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bits, expected at most %d bits for %d players.",
+			te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bits, expected at most %d bits for %d players.",
 				remainingBitsSize, expectedMaxBitsSize, iNumberOfPlayers);
             return false;
         }
