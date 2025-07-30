@@ -3,7 +3,6 @@
 
 #include <vector>
 #include <string>
-#include <array>
 #include <regex>
 
 #include "Detours/detours_x86.h"
@@ -12,13 +11,10 @@
 namespace te::rce::fz::bypass
 {
 	// Signatures
-	constexpr const char* SIG_FENIXZONE_COMM = "55 89 E5 57 56 53 83 EC 4C 8B 75 08 C7 44 24 ? ? ? ? ? C7 44 24 ? ? ? ? ? C7 04 24 ? ? ? ? FF 15 ? ? ? ? 89 C3";
-	constexpr const char* SIG_FENIXZONE_CLOSE = "55 89 E5 83 EC 18 C7 05 ? ? ? ? ? ? ? ?";
-	constexpr const char* SIG_FENIXZONE_CHAT = "55 89 E5 56 53 83 EC 10 E8 ? ? ? ?";
-	constexpr const char* SIG_FENIXZONE_CHAT_PUSH = "55 89 E5 53 89 C3 83 EC 14 E8 ? ? ? ?";
-	constexpr const char* SIG_FENIXZONE_TIMER = "C7 44 24 ? ? ? ? ? C7 44 24 ? ? ? ? ? C7 44 24 ? ? ? ? ? C7 04 24 ? ? ? ? E8 ? ? ? ? 83 EC 10 C7 44 24 ? ? ? ? ? C7 44 24 ? ? ? ? ? C7 44 24 ? ? ? ? ? C7 04 24 ? ? ? ?";
-	constexpr const char* SIG_FENIXZONE_TIMER_FUNC = "55 89 E5 57 56 53 81 EC ? ? ? ? 83 3D ? ? ? ? ?";
-	constexpr const char* SIG_FENIXZONE_ENTRY = "C7 04 24 ? ? ? ? E8 ? ? ? ? 56 8B 80 ? ? ? ? C6 40 04 02 E8";
+	constexpr auto SIG_FENIXZONE_CLOSE = "55 89 E5 83 EC 18 C7 05 ? ? ? ? ? ? ? ?";
+	constexpr auto SIG_FENIXZONE_CHAT_PUSH = "55 89 E5 53 89 C3 83 EC 14 E8 ? ? ? ?";
+	constexpr auto SIG_FENIXZONE_TIMER_FUNC = "55 89 E5 57 56 53 81 EC ? ? ? ? 83 3D ? ? ? ? ?";
+	constexpr auto SIG_FENIXZONE_ENTRY = "C7 04 24 ? ? ? ? E8 ? ? ? ? 56 8B 80 ? ? ? ? C6 40 04 02 E8";
 
 	// Global variables
 	uintptr_t g_mappedBase = 0;
@@ -41,48 +37,54 @@ namespace te::rce::fz::bypass
 	std::unordered_map<std::string, PatternData> s_patternCache;
 
 	static std::recursive_mutex g_memoryProtectionMutex;
-	static std::atomic<bool> g_isProcessingButo{ false };
+	static std::atomic<bool> g_isProcessingButo{false};
 
 	static int CallOriginal(int a1)
 	{
 		int result;
 		__asm {
-			mov  eax, a1
+			mov eax, a1
 			call trampoline
-			mov  result, eax
-		}
+			mov result, eax
+			}
 		return result;
 	}
 
-	bool SafeVirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect) {
+	bool SafeVirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect)
+	{
 		std::lock_guard<std::recursive_mutex> lock(g_memoryProtectionMutex);
 		return VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect) != FALSE;
 	}
 
-	std::string RandomHex() {
+	std::string RandomHex()
+	{
 		std::stringstream ss;
 		ss << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << (rand() & 0xFFFFFFFF);
 		return ss.str();
 	}
 
-	std::string RandomMonitorID() {
-		static const char* vendors[] = { "AUO", "CMN", "LGD", "SHP", "BOE" };
+	std::string RandomMonitorID()
+	{
+		static const char* vendors[] = {"AUO", "CMN", "LGD", "SHP", "BOE"};
 		int vendorIdx = rand() % 5;
 		int code = 1000 + rand() % 9000;
 		return vendors[vendorIdx] + std::to_string(code);
 	}
 
-	std::string RandomResolution() {
-		static const char* resolutions[] = { "1920X1080", "2560X1440", "1366X768", "1600X900", "3440X1440" };
+	std::string RandomResolution()
+	{
+		static const char* resolutions[] = {"1920X1080", "2560X1440", "1366X768", "1600X900", "3440X1440"};
 		return resolutions[rand() % 5];
 	}
 
-	std::string RandomRAM() {
+	std::string RandomRAM()
+	{
 		int ramMb = (8 + rand() % 24) * 1024;
 		return std::to_string(ramMb * 1024) + " KB";
 	}
 
-	std::string RandomCPU() {
+	std::string RandomCPU()
+	{
 		static const char* cpus[] = {
 			"Intel(R) Core(TM) i9-14900K", "AMD Ryzen 9 5900X",
 			"Intel(R) Core(TM) i5-12600H", "AMD Ryzen 7 7840HS"
@@ -90,18 +92,21 @@ namespace te::rce::fz::bypass
 		return cpus[rand() % 4];
 	}
 
-	bool IsSpoofableCommand(const std::string& line) {
+	bool IsSpoofableCommand(const std::string& line)
+	{
 		std::regex pattern(R"(\/(buto|quto).*?0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8})");
 		return std::regex_search(line, pattern);
 	}
 
-	std::string ReplaceHexWithRandom(const std::string& input) {
+	std::string ReplaceHexWithRandom(const std::string& input)
+	{
 		std::smatch match;
 		std::regex hexRegex(R"(0x[0-9A-Fa-f]{8})");
 		std::string result;
-		std::string::const_iterator searchStart(input.cbegin());
+		auto searchStart(input.cbegin());
 
-		while (std::regex_search(searchStart, input.cend(), match, hexRegex)) {
+		while (std::regex_search(searchStart, input.cend(), match, hexRegex))
+		{
 			result.append(searchStart, match[0].first);
 			result.append(RandomHex());
 			searchStart = match[0].second;
@@ -110,45 +115,105 @@ namespace te::rce::fz::bypass
 		return result;
 	}
 
-	std::string SpoofCommandHWData(const std::string& input) {
-		try {
-			if (!IsSpoofableCommand(input)) {
+	std::string GetRandomDisplayDevice()
+	{
+		static const char* displayDevices[] = {
+			"NVIDIA GeForce RTX 4080", "AMD Radeon RX 7900 XTX",
+			"NVIDIA GeForce RTX 3070", "AMD Radeon RX 6800 XT",
+			"NVIDIA GeForce GTX 1660 Ti", "AMD Radeon RX 5700 XT"
+		};
+		return displayDevices[rand() % 6];
+	}
+
+	std::string GetRandomCPUBrand()
+	{
+		char cpuBrand[48] = {};
+		// Simulate random CPU brand string from CPUID
+		static const char* brands[] = {
+			"GenuineIntel", "AuthenticAMD", "CentaurHauls"
+		};
+		strcpy(cpuBrand, brands[rand() % 3]);
+		return std::string(cpuBrand);
+	}
+
+	std::string GenerateRandomCPUID()
+	{
+		// Generate random CPUID values similar to the assembly function
+		uint32_t eax = 0x00000001 + (rand() & 0xFFFF);
+		uint32_t edx = 0x078BFBFF + (rand() & 0xFFFF);
+		uint32_t ecx = 0x7FFAFBBF + (rand() & 0xFFFF);
+
+		char buffer[64];
+		snprintf(buffer, sizeof(buffer), "0x%08X 0x%08X 0x%08X", eax, edx, ecx);
+		return std::string(buffer);
+	}
+
+	std::string SpoofCommandHWData(const std::string& input)
+	{
+		try
+		{
+			if (!IsSpoofableCommand(input))
+			{
 				return input;
 			}
 
 			std::string output = input;
 
+			// Spoof display device information (like EnumDisplayDevicesA)
+			output = std::regex_replace(output,
+			                            std::regex(R"(\b(?:NVIDIA|AMD|Intel).*?(?:RTX|GTX|Radeon|Arc).*?\b)"),
+			                            GetRandomDisplayDevice());
+
+			// Spoof memory information (like GlobalMemoryStatusEx)
 			output = std::regex_replace(output, std::regex(R"(\b\d{7,9} KB\b)"), RandomRAM());
-			output = std::regex_replace(output, std::regex(R"((\d+(?:th)? Gen .+? Core\(TM\) .+?H))"), RandomCPU());
+
+			// Spoof processor count (like GetSystemInfo)
+			output = std::regex_replace(output,
+			                            std::regex(R"(\b(\d{1,2})(?= \d{1,2}-\d{1,2}-\d{1,2}-\d{1,2}))"),
+			                            std::to_string(4 + rand() % 13)); // 4-16 processors
+
+			// Spoof keyboard type information (like GetKeyboardType calls)
+			output = std::regex_replace(output,
+			                            std::regex(R"(\b\d{1,2}-\d{1,2}-\d{1,2}-\d{1,2}\b)"),
+			                            std::to_string(4 + rand() % 4) + "-" + // Keyboard type (4-7)
+			                            std::to_string(rand() % 12) + "-" + // Keyboard subtype (0-11)
+			                            std::to_string(1 + rand() % 12) + "-" + // Function keys (1-12)
+			                            std::to_string(43 + rand() % 10)); // System metrics variation
+
+			// Spoof CPU brand string (from CPUID)
+			output = std::regex_replace(output,
+			                            std::regex(R"(\b(?:GenuineIntel|AuthenticAMD|CentaurHauls)\b)"),
+			                            GetRandomCPUBrand());
+
+			// Spoof CPU model information
+			output = std::regex_replace(output,
+			                            std::regex(R"((\d+(?:th)? Gen .+? Core\(TM\) .+?))"),
+			                            RandomCPU());
+
+			// Spoof CPUID register values (the 0x08X format from assembly)
+			output = std::regex_replace(output,
+			                            std::regex(R"(0x[0-9A-Fa-f]{8} 0x[0-9A-Fa-f]{8} 0x[0-9A-Fa-f]{8})"),
+			                            GenerateRandomCPUID());
+
+			// Spoof individual hex values
+			output = ReplaceHexWithRandom(output);
+
+			// Spoof monitor information
 			output = std::regex_replace(output, std::regex(R"(\b[A-Z]{3}\d{4}\b)"), RandomMonitorID());
 			output = std::regex_replace(output, std::regex(R"(\b\d{3,4}X\d{3,4}\b)"), RandomResolution());
 
-			output = std::regex_replace(
-				output,
-				std::regex(R"(\b(\d{1,2})(?= \d{1,2}-\d{1,2}-\d{1,2}-\d{1,2}))"),
-				std::to_string(8 + rand() % 25)
-			);
-
-			output = std::regex_replace(
-				output,
-				std::regex(R"(\b\d{1,2}-\d{1,2}-\d{1,2}-\d{1,2}\b)"),
-				std::to_string(rand() % 10) + "-" +
-				std::to_string(rand() % 10) + "-" +
-				std::to_string(rand() % 20) + "-" +
-				std::to_string(rand() % 20)
-			);
-
-			output = ReplaceHexWithRandom(output);
-
 			return output;
 		}
-		catch (const std::regex_error& e) {
+		catch (const std::regex_error& e)
+		{
 			te_sdk::helper::logging::Log("[REGEX ERROR] %s", e.what());
 		}
-		catch (const std::exception& e) {
+		catch (const std::exception& e)
+		{
 			te_sdk::helper::logging::Log("[EXCEPTION] %s", e.what());
 		}
-		catch (...) {
+		catch (...)
+		{
 			te_sdk::helper::logging::Log("[UNKNOWN ERROR] An unknown error occurred while processing the command.");
 		}
 		return input;
@@ -156,16 +221,17 @@ namespace te::rce::fz::bypass
 
 	int __cdecl MySayImpl(int a1, void* returnAddress)
 	{
-		char* str = reinterpret_cast<char*>(a1);
+		auto str = reinterpret_cast<char*>(a1);
 		if (!str || IsBadStringPtrA(str, 256))
 			return CallOriginal(a1);
 
+		//auto spoofedCommand = std::string(str);
 		auto spoofedCommand = SpoofCommandHWData(str);
 
 		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Command: %s", spoofedCommand.c_str());
 
 #undef min
-		size_t copyLen = std::min(spoofedCommand.length(), size_t(255));
+		size_t copyLen = std::min(spoofedCommand.length(), static_cast<size_t>(255));
 		strncpy(str, spoofedCommand.c_str(), copyLen);
 		str[copyLen] = '\0';
 
@@ -175,37 +241,41 @@ namespace te::rce::fz::bypass
 	bool InitButoPointers()
 	{
 		// 1. dword_6C0CEC00 (seed)
-		const char* sigSeed = "A1 ? ? ? ? 05 ? ? ? ? 89 85 ? ? ? ? EB 17";
-		uintptr_t matchSeed = te::rce::helper::PatternScan((uint32_t)g_mappedBase, sigSeed, false);
+		auto sigSeed = "A1 ? ? ? ? 05 ? ? ? ? 89 85 ? ? ? ? EB 17";
+		uintptr_t matchSeed = helper::PatternScan(g_mappedBase, sigSeed, false);
 		if (!matchSeed)
 		{
 			te_sdk::helper::logging::Log("[InitButoPointers] Signature for seed not found.");
 			return false;
 		}
 		g_seedAddr = *(uint32_t*)(matchSeed + 1);
-		te_sdk::helper::logging::Log("[InitButoPointers] Found seed: RVA=0x%X -> VA=0x%08X", matchSeed - (uintptr_t)g_mappedBase, g_seedAddr);
+		te_sdk::helper::logging::Log("[InitButoPointers] Found seed: RVA=0x%X -> VA=0x%08X", matchSeed - g_mappedBase,
+		                             g_seedAddr);
 
 		// 2. dword_6C0CF450 (counter)
-		const char* sigCounter = "A3 ? ? ? ? 83 F8 02 75 10 FF 05 ? ? ? ? C7 05";
-		uintptr_t matchCounter = te::rce::helper::PatternScan((uintptr_t)g_mappedBase, sigCounter, false);
+		auto sigCounter = "A3 ? ? ? ? 83 F8 02 75 10 FF 05 ? ? ? ? C7 05";
+		uintptr_t matchCounter = helper::PatternScan(g_mappedBase, sigCounter, false);
 		if (!matchCounter)
 		{
 			te_sdk::helper::logging::Log("[InitButoPointers] Signature for counter not found.");
 			return false;
 		}
 		g_counterAddr = *(uint32_t*)(matchCounter + 1);
-		te_sdk::helper::logging::Log("[InitButoPointers] Found counter: RVA=0x%X -> VA=0x%08X", matchCounter - (uintptr_t)g_mappedBase, g_counterAddr);
+		te_sdk::helper::logging::Log("[InitButoPointers] Found counter: RVA=0x%X -> VA=0x%08X",
+		                             matchCounter - g_mappedBase, g_counterAddr);
 
 		// 3. byte_6C0CA160 (input string)
-		const char* sigArray = "B8 ? ? ? ? 8D 4B 01 E8 ? ? ? ? C6 83 ? ? ? ? ? E8 ? ? ? ? 89 74 24 08 C7 44 24 ? ? ? ? ? 89 04 24 E8 ? ? ? ? 83 EC 0C EB 07";
-		uintptr_t matchArray = te::rce::helper::PatternScan((uint32_t)g_mappedBase, sigArray, false);
+		auto sigArray =
+			"B8 ? ? ? ? 8D 4B 01 E8 ? ? ? ? C6 83 ? ? ? ? ? E8 ? ? ? ? 89 74 24 08 C7 44 24 ? ? ? ? ? 89 04 24 E8 ? ? ? ? 83 EC 0C EB 07";
+		uintptr_t matchArray = helper::PatternScan(g_mappedBase, sigArray, false);
 		if (!matchArray)
 		{
 			te_sdk::helper::logging::Log("[InitButoPointers] Signature for byte array not found.");
 			return false;
 		}
 		g_byteArrayAddr = *(uint32_t*)(matchArray + 1);
-		te_sdk::helper::logging::Log("[InitButoPointers] Found byteArray: RVA=0x%X -> VA=0x%08X", matchArray - (uintptr_t)g_mappedBase, g_byteArrayAddr);
+		te_sdk::helper::logging::Log("[InitButoPointers] Found byteArray: RVA=0x%X -> VA=0x%08X",
+		                             matchArray - g_mappedBase, g_byteArrayAddr);
 
 		return true;
 	}
@@ -218,7 +288,7 @@ namespace te::rce::fz::bypass
 			call MySayImpl
 			add esp, 8
 			ret
-		}
+			}
 	}
 
 	void __stdcall hkTerminateGTA(HWND hWnd, UINT msg, UINT_PTR idEvent, DWORD dwTime)
@@ -230,21 +300,25 @@ namespace te::rce::fz::bypass
 	std::string GenerateButoStringFromMappedMemory()
 	{
 		// Prevent recursive calls that could cause deadlock
-		if (g_isProcessingButo.exchange(true)) {
+		if (g_isProcessingButo.exchange(true))
+		{
 			return "";
 		}
 
-		if (g_seedAddr == 0 || g_counterAddr == 0 || g_byteArrayAddr == 0) {
-			te_sdk::helper::logging::Log("[GenerateButoStringFromMappedMemory] Invalid pointer(s): seed=0x%X counter=0x%X array=0x%X",
+		if (g_seedAddr == 0 || g_counterAddr == 0 || g_byteArrayAddr == 0)
+		{
+			te_sdk::helper::logging::Log(
+				"[GenerateButoStringFromMappedMemory] Invalid pointer(s): seed=0x%X counter=0x%X array=0x%X",
 				g_seedAddr, g_counterAddr, g_byteArrayAddr);
 			g_isProcessingButo = false;
 			return "";
 		}
 
-		try {
-			uint32_t* pCounter = reinterpret_cast<uint32_t*>(g_counterAddr);
-			uint32_t* pSeed = reinterpret_cast<uint32_t*>(g_seedAddr);
-			uint8_t* byteArray = reinterpret_cast<uint8_t*>(g_byteArrayAddr);
+		try
+		{
+			auto pCounter = reinterpret_cast<uint32_t*>(g_counterAddr);
+			auto pSeed = reinterpret_cast<uint32_t*>(g_seedAddr);
+			auto byteArray = reinterpret_cast<uint8_t*>(g_byteArrayAddr);
 
 			uint32_t hFileb = *pSeed + 300;
 			uint8_t buffer[0x80] = {};
@@ -257,7 +331,7 @@ namespace te::rce::fz::bypass
 			{
 				uint8_t ch = byteArray[i];
 				uint32_t tmp = ((hFileb >> 3) + 7) ^ (33 * hFileb);
-				uint8_t mixed = (uint8_t)((tmp << 5) | (tmp >> 3));
+				uint8_t mixed = static_cast<uint8_t>((tmp << 5) | (tmp >> 3));
 				uint8_t v30 = mixed ^ ch;
 				hFileb = mixed;
 
@@ -291,15 +365,16 @@ namespace te::rce::fz::bypass
 			}
 
 			g_isProcessingButo = false;
-			return std::string((char*)buffer);
+			return std::string(reinterpret_cast<char*>(buffer));
 		}
-		catch (...) {
+		catch (...)
+		{
 			g_isProcessingButo = false;
 			return "";
 		}
 	}
 
-	typedef void(__cdecl* tSub6C0C12A8)(
+	using tTimerFunc = void(__cdecl*)(
 		struct _WIN32_FIND_DATAA* FirstFileA,
 		signed int cFileName,
 		struct _FILETIME* p_Buffer,
@@ -307,11 +382,11 @@ namespace te::rce::fz::bypass
 		UINT a5,
 		UINT_PTR a6,
 		DWORD a7);
-	tSub6C0C12A8 oSub6C0C12A8 = nullptr;
+	tTimerFunc oTimerFunc = nullptr;
 
-	int g_step = 0;
+	static auto g_step = 0;
 
-	void __cdecl hkSub6C0C12A8(
+	void __cdecl hkTimerFunc(
 		struct _WIN32_FIND_DATAA* FirstFileA,
 		signed int cFileName,
 		struct _FILETIME* p_Buffer,
@@ -321,34 +396,54 @@ namespace te::rce::fz::bypass
 		DWORD a7)
 	{
 		//te_sdk::helper::logging::Log("[FenixZone AC Bypass] hkSub6C0C12A8 called. Step: %d", g_step);
+		//oTimerFunc(FirstFileA, cFileName, p_Buffer, a4, a5, a6, a7);
+
+		if (g_step == 6)
+		{
+			WIN32_FIND_DATAA ffd;
+			HANDLE hFind = FindFirstFileA(R"(C:\Users\Public\Pictures\dRA*)", &ffd);
+			if (hFind != INVALID_HANDLE_VALUE)
+			{
+				std::string draPart = std::string("DRA: ") + ffd.cFileName;
+				FindClose(hFind);
+
+				char cmd[256];
+				_snprintf_s(cmd, sizeof(cmd), "/buto %s", draPart.c_str());
+				MySayImpl(reinterpret_cast<int>(cmd), nullptr);
+			}
+		}
 
 		if (g_step > 0 && g_step % 15 == 0)
 		{
 			std::string buto = GenerateButoStringFromMappedMemory();
 
-			char cmd[128];
-			snprintf(cmd, sizeof(cmd), "/buto %s", buto.c_str());
-			MySayImpl((int)cmd, 0);
+			char cmd[256];
+			_snprintf_s(cmd, sizeof(cmd), "/buto %s", buto.c_str());
+			MySayImpl(reinterpret_cast<int>(cmd), nullptr);
 		}
 
 		++g_step;
 	}
 
-	static PatternData& ParsePattern(const char* sig) {
+	static PatternData& ParsePattern(const char* sig)
+	{
 		auto it = s_patternCache.find(sig);
 		if (it != s_patternCache.end()) return it->second;
 
 		PatternData pd;
 		const char* cur = sig;
-		while (*cur) {
-			if (*cur == '?') {
+		while (*cur)
+		{
+			if (*cur == '?')
+			{
 				++cur;
 				if (*cur == '?') ++cur;
 				pd.bytes.push_back(0);
 				pd.mask.push_back(false);
 			}
-			else {
-				pd.bytes.push_back(uint8_t(strtoul(cur, const_cast<char**>(&cur), 16)));
+			else
+			{
+				pd.bytes.push_back(static_cast<uint8_t>(strtoul(cur, const_cast<char**>(&cur), 16)));
 				pd.mask.push_back(true);
 			}
 			if (*cur == ' ') ++cur;
@@ -358,44 +453,54 @@ namespace te::rce::fz::bypass
 		return s_patternCache.emplace(sig, std::move(pd)).first->second;
 	}
 
-	uintptr_t PatternScanRCEOnly(const char* signature, bool skipFirst = false) {
+	uintptr_t PatternScanRCEOnly(const char* signature, bool skipFirst = false)
+	{
 		auto& pat = ParsePattern(signature);
-		size_t  pLen = pat.bytes.size();
+		size_t pLen = pat.bytes.size();
 		if (pLen == 0) return 0;
 
 		MEMORY_BASIC_INFORMATION mbi;
 		uintptr_t address = 0;
 		bool foundOnce = false;
 
-		while (VirtualQuery((void*)address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+		while (VirtualQuery((void*)address, &mbi, sizeof(mbi)) == sizeof(mbi))
+		{
 			if (mbi.State == MEM_COMMIT
 				&& mbi.Type == MEM_PRIVATE
 				&& (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
 				&& !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
 			{
 				auto* region = reinterpret_cast<const uint8_t*>(mbi.BaseAddress);
-				size_t  regionSize = mbi.RegionSize;
-				if (regionSize >= pLen) {
+				size_t regionSize = mbi.RegionSize;
+				if (regionSize >= pLen)
+				{
 					const uint8_t* cur = region;
 					const uint8_t* end = region + regionSize - pLen;
 
-					while (cur <= end) {
-						if (!pat.firstWildcard) {
-							cur = (const uint8_t*)memchr(cur, pat.firstByte, (end - cur) + 1);
+					while (cur <= end)
+					{
+						if (!pat.firstWildcard)
+						{
+							cur = static_cast<const uint8_t*>(memchr(cur, pat.firstByte, (end - cur) + 1));
 							if (!cur) break;
 						}
 						bool ok = true;
-						for (size_t j = 0; j < pLen; ++j) {
-							if (pat.mask[j] && cur[j] != pat.bytes[j]) {
+						for (size_t j = 0; j < pLen; ++j)
+						{
+							if (pat.mask[j] && cur[j] != pat.bytes[j])
+							{
 								ok = false;
 								break;
 							}
 						}
-						if (ok) {
-							if (skipFirst && !foundOnce) {
+						if (ok)
+						{
+							if (skipFirst && !foundOnce)
+							{
 								foundOnce = true;
 							}
-							else {
+							else
+							{
 								return uintptr_t(cur);
 							}
 						}
@@ -416,9 +521,9 @@ namespace te::rce::fz::bypass
 		constexpr SIZE_T prologueSize = 9;
 		memcpy(originalPrologue, (void*)g_HookAddress, prologueSize);
 
-		trampoline = (BYTE*)VirtualAlloc(NULL, prologueSize + 5,
-			MEM_COMMIT | MEM_RESERVE,
-			PAGE_EXECUTE_READWRITE);
+		trampoline = static_cast<BYTE*>(VirtualAlloc(NULL, prologueSize + 5,
+		                                             MEM_COMMIT | MEM_RESERVE,
+		                                             PAGE_EXECUTE_READWRITE));
 		if (!trampoline) return false;
 
 		memcpy(trampoline, originalPrologue, prologueSize);
@@ -426,17 +531,18 @@ namespace te::rce::fz::bypass
 		BYTE* p = trampoline + prologueSize;
 		p[0] = 0xE9;
 		*reinterpret_cast<DWORD*>(p + 1) =
-			(DWORD)((g_HookAddress + prologueSize) - (((uintptr_t)p) + 5));
+			g_HookAddress + prologueSize - ((uintptr_t)p + 5);
 
 		DWORD old;
-		if (!SafeVirtualProtect((LPVOID)g_HookAddress, 5, PAGE_EXECUTE_READWRITE, &old)) {
+		if (!SafeVirtualProtect((LPVOID)g_HookAddress, 5, PAGE_EXECUTE_READWRITE, &old))
+		{
 			return false;
 		}
 		{
-			BYTE* dst = (BYTE*)g_HookAddress;
+			auto dst = (BYTE*)g_HookAddress;
 			dst[0] = 0xE9; // JMP
 			*reinterpret_cast<DWORD*>(dst + 1) =
-				(DWORD)((uintptr_t)MySay - (g_HookAddress + 5));
+				static_cast<DWORD>((uintptr_t)MySay - (g_HookAddress + 5));
 		}
 		SafeVirtualProtect((LPVOID)g_HookAddress, 5, old, &old);
 		return true;
@@ -456,13 +562,16 @@ namespace te::rce::fz::bypass
 		*original = reinterpret_cast<LPVOID>(sig);
 
 		error = DetourTransactionBegin();
-		if (error != NO_ERROR) {
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionBegin failed for %s: %ld", name, error);
+		if (error != NO_ERROR)
+		{
+			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionBegin failed for %s: %ld", name,
+			                             error);
 			return false;
 		}
 
 		error = DetourUpdateThread(GetCurrentThread());
-		if (error != NO_ERROR) {
+		if (error != NO_ERROR)
+		{
 			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourUpdateThread failed for %s: %ld", name, error);
 			DetourTransactionAbort();
 			return false;
@@ -470,15 +579,18 @@ namespace te::rce::fz::bypass
 
 		// Attach
 		error = DetourAttach(original, hookFunc);
-		if (error != NO_ERROR) {
+		if (error != NO_ERROR)
+		{
 			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourAttach failed for %s: %ld", name, error);
 			DetourTransactionAbort();
 			return false;
 		}
 
 		error = DetourTransactionCommit();
-		if (error != NO_ERROR) {
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionCommit failed for %s: %ld", name, error);
+		if (error != NO_ERROR)
+		{
+			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionCommit failed for %s: %ld", name,
+			                             error);
 			return false;
 		}
 
@@ -490,14 +602,14 @@ namespace te::rce::fz::bypass
 	{
 		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Scanning for signatures...");
 
-		uintptr_t sigTerminateGTA = te::rce::helper::PatternScan((uint32_t)g_mappedBase, SIG_FENIXZONE_CLOSE, false);
-		uintptr_t sigTimerFunc = te::rce::helper::PatternScan((uint32_t)g_mappedBase, SIG_FENIXZONE_TIMER_FUNC, false);
+		uintptr_t sigTerminateGTA = helper::PatternScan(g_mappedBase, SIG_FENIXZONE_CLOSE, false);
+		uintptr_t sigTimerFunc = helper::PatternScan(g_mappedBase, SIG_FENIXZONE_TIMER_FUNC, false);
 
 		bool success = true;
 
 		success &= TryCreateHook("TerminateGTA", sigTerminateGTA, &hkTerminateGTA, reinterpret_cast<LPVOID*>(&oTerminateGTA));
 		success &= HookChatPush();
-		success &= TryCreateHook("TimerFunc", sigTimerFunc, &hkSub6C0C12A8, reinterpret_cast<LPVOID*>(&oSub6C0C12A8));
+		success &= TryCreateHook("TimerFunc", sigTimerFunc, &hkTimerFunc, reinterpret_cast<LPVOID*>(&oTimerFunc));
 
 		if (success)
 			te_sdk::helper::logging::Log("[FenixZone AC Bypass] All hooks attached successfully.");
@@ -522,10 +634,10 @@ namespace te::rce::fz::bypass
 
 		SIZE_T imageSize = ntHdr->OptionalHeader.SizeOfImage;
 
-		BYTE* mapped = (BYTE*)VirtualAlloc(nullptr,
-			imageSize,
-			MEM_COMMIT | MEM_RESERVE,
-			PAGE_EXECUTE_READWRITE);
+		auto mapped = static_cast<BYTE*>(VirtualAlloc(nullptr,
+		                                              imageSize,
+		                                              MEM_COMMIT | MEM_RESERVE,
+		                                              PAGE_EXECUTE_READWRITE));
 		if (!mapped) return nullptr;
 
 		SIZE_T headersSize = ntHdr->OptionalHeader.SizeOfHeaders;
@@ -560,13 +672,14 @@ namespace te::rce::fz::bypass
 					WORD offset = *entry & 0x0FFF;
 					if (type == IMAGE_REL_BASED_HIGHLOW || type == IMAGE_REL_BASED_DIR64)
 					{
-						ULONG_PTR* patchAddr = reinterpret_cast<ULONG_PTR*>(
+						auto patchAddr = reinterpret_cast<ULONG_PTR*>(
 							mapped + relocDir->VirtualAddress + offset);
 						*patchAddr = *patchAddr + delta;
 					}
 				}
 				parsed += relocDir->SizeOfBlock;
-				relocDir = reinterpret_cast<PIMAGE_BASE_RELOCATION>(reinterpret_cast<BYTE*>(relocDir) + relocDir->SizeOfBlock);
+				relocDir = reinterpret_cast<PIMAGE_BASE_RELOCATION>(reinterpret_cast<BYTE*>(relocDir) + relocDir->
+					SizeOfBlock);
 			}
 		}
 
@@ -577,7 +690,7 @@ namespace te::rce::fz::bypass
 				mapped + impDir.VirtualAddress);
 			for (; importDesc->Name; ++importDesc)
 			{
-				char* dllName = reinterpret_cast<char*>(mapped + importDesc->Name);
+				auto dllName = reinterpret_cast<char*>(mapped + importDesc->Name);
 				HMODULE hDll = LoadLibraryA(dllName);
 				if (!hDll) continue;
 
@@ -617,17 +730,18 @@ namespace te::rce::fz::bypass
 		{
 			auto* dos = (PIMAGE_DOS_HEADER)g_mappedBase;
 			auto* nt = (PIMAGE_NT_HEADERS)(g_mappedBase + dos->e_lfanew);
-			g_stubEP = (uintptr_t)g_mappedBase + nt->OptionalHeader.AddressOfEntryPoint;
+			g_stubEP = g_mappedBase + nt->OptionalHeader.AddressOfEntryPoint;
 		}
 
 		DWORD oldProt;
-		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, PAGE_EXECUTE_READWRITE, &oldProt))
+		{
 			return;
 		}
 
-		BYTE* p = (BYTE*)g_stubEP;
+		auto p = (BYTE*)g_stubEP;
 
-		uintptr_t realDllMainAddr = (uintptr_t)g_mappedBase + g_entryRVA;
+		uintptr_t realDllMainAddr = g_mappedBase + g_entryRVA;
 		for (size_t i = 0; i + 5 <= g_stubScanSize; ++i)
 		{
 			if (p[i] == 0xE8)
@@ -677,10 +791,11 @@ namespace te::rce::fz::bypass
 
 	void SimulateVirtualProtectPatch()
 	{
-		BYTE* addr = reinterpret_cast<BYTE*>(0x6E2E50);
+		auto addr = reinterpret_cast<BYTE*>(0x6E2E50);
 		DWORD oldProtect;
 
-		if (!SafeVirtualProtect(addr, 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+		if (!SafeVirtualProtect(addr, 3, PAGE_EXECUTE_READWRITE, &oldProtect))
+		{
 			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Failed VirtualProtect on 0x6E2E50.");
 			return;
 		}
@@ -696,9 +811,10 @@ namespace te::rce::fz::bypass
 
 	uintptr_t Get_CreateThreadFunction()
 	{
-		const char* sigCall = "E8 ? ? ? ? 83 EC 0C C9";
-		uintptr_t match = te::rce::helper::PatternScan((uint32_t)g_mappedBase, sigCall, false);
-		if (!match) {
+		auto sigCall = "E8 ? ? ? ? 83 EC 0C C9";
+		uintptr_t match = helper::PatternScan(g_mappedBase, sigCall, false);
+		if (!match)
+		{
 			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to find call to CreateThread function.");
 			return 0;
 		}
@@ -706,11 +822,13 @@ namespace te::rce::fz::bypass
 		int32_t relOffset = *reinterpret_cast<int32_t*>(match + 1);
 		uintptr_t targetAddr = match + 5 + relOffset;
 
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Found CreateThread initializer function at: 0x%08X", targetAddr);
+		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Found CreateThread initializer function at: 0x%08X",
+		                             targetAddr);
 		return targetAddr;
 	}
 
-	struct ThreadSig {
+	struct ThreadSig
+	{
 		const char* name;
 		const char* pattern;
 		bool ripRelative;
@@ -724,38 +842,38 @@ namespace te::rce::fz::bypass
 		g_threadSigs.clear();
 
 		g_threadSigs.push_back({
-			"sub_6C0C5630",
+			"block_1",
 			"55 89 E5 83 EC 08 E8 ? ? ? ?",
 			true
-			});
+		});
 
 		g_threadSigs.push_back({
-			"sub_6C0C7868",
+			"block_2",
 			"55 89 E5 53 31 DB 83 EC 24 E8 ? ? ? ? 8D 55 F4 C7 45 ? ? ? ? ? 89 54 24 04 89 04 24 E8 ? ? ? ? 51",
 			false
-			});
+		});
 
 		g_threadSigs.push_back({
-			"sub_6C0C55E0",
+			"block_3",
 			"55 89 E5 53 31 DB 83 EC 24 E8 ? ? ? ? 8D 55 F4 C7 45 ? ? ? ? ? 89 54 24 04 89 04 24 E8 ? ? ? ? 52",
 			false
-			});
+		});
 
 		g_threadSigs.push_back({
-			"sub_6C0C8140",
+			"block_4",
 			"55 89 E5 83 EC 28 E8 ? ? ? ?",
 			false
-			});
+		});
 
 		g_threadSigs.push_back({
-			"sub_6C0C5644",
+			"block_5",
 			"55 89 E5 57 56 53 81 EC ? ? ? ? C7 04 24 ? ? ? ? E8 ? ? ? ? 89 85 ? ? ? ?",
 			false
-			});
+		});
 
 		for (auto& sig : g_threadSigs)
 		{
-			uintptr_t match = te::rce::helper::PatternScan((uintptr_t)g_mappedBase, sig.pattern, sig.ripRelative);
+			uintptr_t match = helper::PatternScan(g_mappedBase, sig.pattern, sig.ripRelative);
 			if (match)
 			{
 				sig.resolvedAddress = match;
@@ -770,7 +888,7 @@ namespace te::rce::fz::bypass
 
 	size_t GetFunctionSizeByRetn(uintptr_t funcAddr, size_t maxScanSize = 0x1000)
 	{
-		uint8_t* code = reinterpret_cast<uint8_t*>(funcAddr);
+		auto code = reinterpret_cast<uint8_t*>(funcAddr);
 
 		for (size_t i = 0; i + 2 < maxScanSize; ++i)
 		{
@@ -792,7 +910,7 @@ namespace te::rce::fz::bypass
 			return;
 		}
 
-		uint8_t* code = reinterpret_cast<uint8_t*>(funcAddr);
+		auto code = reinterpret_cast<uint8_t*>(funcAddr);
 		int patched = 0;
 
 		for (size_t i = 0; i + 40 < funcSize; ++i)
@@ -847,14 +965,15 @@ namespace te::rce::fz::bypass
 		{
 			if (sig.resolvedAddress == 0) continue;
 
-			Patch_CreateThread_ByStartAddress((uintptr_t)funcAddr, sig.resolvedAddress);
+			Patch_CreateThread_ByStartAddress(funcAddr, sig.resolvedAddress);
 		}
 
 		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Patch CreateThread done.");
 	}
 
 	// Function to scan BitStream for MZ header and save PE executables
-	bool ScanForPEExecutable(BitStream* bs, int rpcId, const std::string& rpcName) {
+	bool ScanForPEExecutable(BitStream* bs, int rpcId, const std::string& rpcName)
+	{
 		// Make a copy of the BitStream to avoid modifying the original read position
 		int originalOffset = bs->GetReadOffset();
 
@@ -875,33 +994,39 @@ namespace te::rce::fz::bypass
 		size_t mzOffset = 0;
 		bool foundMZ = false;
 
-		for (size_t i = 0; i < allData.size() - 1; i++) {
-			if (allData[i] == 0x4D && allData[i + 1] == 0x5A) {
+		for (size_t i = 0; i < allData.size() - 1; i++)
+		{
+			if (allData[i] == 0x4D && allData[i + 1] == 0x5A)
+			{
 				foundMZ = true;
 				mzOffset = i;
 				break;
 			}
 		}
 
-		if (!foundMZ) {
+		if (!foundMZ)
+		{
 			return false; // No MZ header found
 		}
 
 		// Verify this is potentially a valid PE file
 		// Check for "PE\0\0" signature which should be at MZ header + offset 0x3C
-		if (mzOffset + 0x40 >= allData.size()) {
+		if (mzOffset + 0x40 >= allData.size())
+		{
 			return false; // Not enough data for a PE header
 		}
 
 		// Read the PE header offset from the MZ header
 		uint32_t peOffset = 0;
-		if (mzOffset + 0x3C + sizeof(uint32_t) <= allData.size()) {
+		if (mzOffset + 0x3C + sizeof(uint32_t) <= allData.size())
+		{
 			peOffset = *reinterpret_cast<uint32_t*>(&allData[mzOffset + 0x3C]);
 		}
 
 		// Check if PE signature is present
 		bool isPEFile = false;
-		if (mzOffset + peOffset + 4 <= allData.size()) {
+		if (mzOffset + peOffset + 4 <= allData.size())
+		{
 			isPEFile = (allData[mzOffset + peOffset] == 'P' &&
 				allData[mzOffset + peOffset + 1] == 'E' &&
 				allData[mzOffset + peOffset + 2] == 0 &&
@@ -909,39 +1034,18 @@ namespace te::rce::fz::bypass
 		}
 
 		// If we have a valid PE file, save it
-		if (isPEFile) {
-			// Extract relevant PE header information for logging
-			std::string fileType;
-			uint16_t machine = 0;
-			uint16_t characteristics = 0;
-			uint32_t timestamp = 0;
+		if (isPEFile)
+		{
+			std::vector<unsigned char> exeData(allData.begin() + mzOffset, allData.end());
 
-			if (mzOffset + peOffset + 24 <= allData.size()) {
-				machine = *reinterpret_cast<uint16_t*>(&allData[mzOffset + peOffset + 4]);
-				timestamp = *reinterpret_cast<uint32_t*>(&allData[mzOffset + peOffset + 8]);
-				characteristics = *reinterpret_cast<uint16_t*>(&allData[mzOffset + peOffset + 22]);
-			}
-
-			// Determine file type based on characteristics
-			if (characteristics & 0x2000) {
-				fileType = "dll";
-			}
-			else if (characteristics & 0x0002) {
-				fileType = "exe";
-			}
-			else {
-				fileType = "bin";
-			}
-
-			// Extract the executable starting from the MZ header
-			size_t exeSize = allData.size() - mzOffset;
-			std::vector<unsigned char> exeData(mzOffset + allData.begin(), allData.end());
-
-			try {
-				auto testSig = te::rce::helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
+			try
+			{
+				auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
 				if (testSig != NULL && g_mappedBase == NULL)
 				{
-					te_sdk::helper::logging::Log("Detected FenixZone Anti Cheat signature in PE executable (rpcId: %i (%s))", rpcId, rpcName.c_str());
+					te_sdk::helper::logging::Log(
+						"Detected FenixZone Anti Cheat signature in PE executable (rpcId: %i (%s))", rpcId,
+						rpcName.c_str());
 
 					ManualMapPE_NoEntry(exeData);
 
@@ -972,7 +1076,8 @@ namespace te::rce::fz::bypass
 
 				return true;
 			}
-			catch (const std::exception& e) {
+			catch (const std::exception& e)
+			{
 				te_sdk::helper::logging::Log("Exception while processing PE executable: %s", e.what());
 			}
 		}
