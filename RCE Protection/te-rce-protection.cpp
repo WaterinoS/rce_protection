@@ -419,7 +419,7 @@ namespace te::rce::helper
 		}
 		catch (std::exception& e)
 		{
-			te_sdk::helper::logging::Log("CheckRPC exception: %s", e.what());
+			te::sdk::helper::logging::Log("CheckRPC exception: %s", e.what());
 			return false; // Block on exception for safety
 		}
 

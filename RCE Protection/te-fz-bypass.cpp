@@ -10,6 +10,25 @@
 
 namespace te::rce::fz::bypass
 {
+	enum class FenixZoneServer
+	{
+		UNKNOWN = 0,
+		S1_FENIXZONE_TV,
+		S2_FENIXZONE_COM,
+		S3_FENIXZONE_COM,
+		S4_FENIXZONE_COM,
+		S5_FENIXZONE_COM
+	};
+
+	struct FenixZoneServerInfo
+	{
+		const char* domain;
+		const char* ip;
+		uint16_t defaultPort;
+		bool isActive;
+	};
+
+
 	// Signatures
 	constexpr auto SIG_FENIXZONE_CLOSE = "55 89 E5 83 EC 18 C7 05 ? ? ? ? ? ? ? ?";
 	constexpr auto SIG_FENIXZONE_CHAT_PUSH = "55 89 E5 53 89 C3 83 EC 14 E8 ? ? ? ?";
@@ -38,6 +57,27 @@ namespace te::rce::fz::bypass
 
 	static std::recursive_mutex g_memoryProtectionMutex;
 	static std::atomic<bool> g_isProcessingButo{false};
+
+	static const std::unordered_map<FenixZoneServer, FenixZoneServerInfo> g_fenixZoneServers = {
+		{FenixZoneServer::S1_FENIXZONE_TV, {"s1.fenixzone.tv", "66.70.203.213", 7777, true}},
+		{FenixZoneServer::S2_FENIXZONE_COM, {"s2.fenixzone.com", "198.27.88.127", 7777, true}},
+		{FenixZoneServer::S3_FENIXZONE_COM, {"s3.fenixzone.com", "66.70.220.66", 7777, true}},
+		{FenixZoneServer::S4_FENIXZONE_COM, {"s4.fenixzone.com", "149.56.43.225", 7777, true}},
+		{FenixZoneServer::S5_FENIXZONE_COM, {"s5.fenixzone.com", "158.69.23.2", 7777, true}}
+	};
+
+	FenixZoneServer IdentifyFenixZoneServer(const std::string& hostOrIp)
+	{
+		// Check by domain name
+		for (const auto& [serverId, serverInfo] : g_fenixZoneServers)
+		{
+			if (hostOrIp == serverInfo.domain || hostOrIp == serverInfo.ip)
+			{
+				return serverId;
+			}
+		}
+		return FenixZoneServer::UNKNOWN;
+	}
 
 	static int CallOriginal(int a1)
 	{
@@ -206,15 +246,15 @@ namespace te::rce::fz::bypass
 		}
 		catch (const std::regex_error& e)
 		{
-			te_sdk::helper::logging::Log("[REGEX ERROR] %s", e.what());
+			te::sdk::helper::logging::Log("[REGEX ERROR] %s", e.what());
 		}
 		catch (const std::exception& e)
 		{
-			te_sdk::helper::logging::Log("[EXCEPTION] %s", e.what());
+			te::sdk::helper::logging::Log("[EXCEPTION] %s", e.what());
 		}
 		catch (...)
 		{
-			te_sdk::helper::logging::Log("[UNKNOWN ERROR] An unknown error occurred while processing the command.");
+			te::sdk::helper::logging::Log("[UNKNOWN ERROR] An unknown error occurred while processing the command.");
 		}
 		return input;
 	}
@@ -228,7 +268,7 @@ namespace te::rce::fz::bypass
 		//auto spoofedCommand = std::string(str);
 		auto spoofedCommand = SpoofCommandHWData(str);
 
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Command: %s", spoofedCommand.c_str());
+		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Command: %s", spoofedCommand.c_str());
 
 #undef min
 		size_t copyLen = std::min(spoofedCommand.length(), static_cast<size_t>(255));
@@ -245,11 +285,11 @@ namespace te::rce::fz::bypass
 		uintptr_t matchSeed = helper::PatternScan(g_mappedBase, sigSeed, false);
 		if (!matchSeed)
 		{
-			te_sdk::helper::logging::Log("[InitButoPointers] Signature for seed not found.");
+			te::sdk::helper::logging::Log("[InitButoPointers] Signature for seed not found.");
 			return false;
 		}
 		g_seedAddr = *(uint32_t*)(matchSeed + 1);
-		te_sdk::helper::logging::Log("[InitButoPointers] Found seed: RVA=0x%X -> VA=0x%08X", matchSeed - g_mappedBase,
+		te::sdk::helper::logging::Log("[InitButoPointers] Found seed: RVA=0x%X -> VA=0x%08X", matchSeed - g_mappedBase,
 		                             g_seedAddr);
 
 		// 2. dword_6C0CF450 (counter)
@@ -257,11 +297,11 @@ namespace te::rce::fz::bypass
 		uintptr_t matchCounter = helper::PatternScan(g_mappedBase, sigCounter, false);
 		if (!matchCounter)
 		{
-			te_sdk::helper::logging::Log("[InitButoPointers] Signature for counter not found.");
+			te::sdk::helper::logging::Log("[InitButoPointers] Signature for counter not found.");
 			return false;
 		}
 		g_counterAddr = *(uint32_t*)(matchCounter + 1);
-		te_sdk::helper::logging::Log("[InitButoPointers] Found counter: RVA=0x%X -> VA=0x%08X",
+		te::sdk::helper::logging::Log("[InitButoPointers] Found counter: RVA=0x%X -> VA=0x%08X",
 		                             matchCounter - g_mappedBase, g_counterAddr);
 
 		// 3. byte_6C0CA160 (input string)
@@ -270,11 +310,11 @@ namespace te::rce::fz::bypass
 		uintptr_t matchArray = helper::PatternScan(g_mappedBase, sigArray, false);
 		if (!matchArray)
 		{
-			te_sdk::helper::logging::Log("[InitButoPointers] Signature for byte array not found.");
+			te::sdk::helper::logging::Log("[InitButoPointers] Signature for byte array not found.");
 			return false;
 		}
 		g_byteArrayAddr = *(uint32_t*)(matchArray + 1);
-		te_sdk::helper::logging::Log("[InitButoPointers] Found byteArray: RVA=0x%X -> VA=0x%08X",
+		te::sdk::helper::logging::Log("[InitButoPointers] Found byteArray: RVA=0x%X -> VA=0x%08X",
 		                             matchArray - g_mappedBase, g_byteArrayAddr);
 
 		return true;
@@ -307,7 +347,7 @@ namespace te::rce::fz::bypass
 
 		if (g_seedAddr == 0 || g_counterAddr == 0 || g_byteArrayAddr == 0)
 		{
-			te_sdk::helper::logging::Log(
+			te::sdk::helper::logging::Log(
 				"[GenerateButoStringFromMappedMemory] Invalid pointer(s): seed=0x%X counter=0x%X array=0x%X",
 				g_seedAddr, g_counterAddr, g_byteArrayAddr);
 			g_isProcessingButo = false;
@@ -347,7 +387,7 @@ namespace te::rce::fz::bypass
 				buffer[len + 2] = 0;
 			}
 
-			//te_sdk::helper::logging::Log("[BUTO] Before increment: seed=%u counter=%u", *pSeed, *pCounter);
+			//te::sdk::helper::logging::Log("[BUTO] Before increment: seed=%u counter=%u", *pSeed, *pCounter);
 
 			DWORD oldProt;
 			if (SafeVirtualProtect(pCounter, sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &oldProt))
@@ -395,7 +435,7 @@ namespace te::rce::fz::bypass
 		UINT_PTR a6,
 		DWORD a7)
 	{
-		//te_sdk::helper::logging::Log("[FenixZone AC Bypass] hkSub6C0C12A8 called. Step: %d", g_step);
+		//te::sdk::helper::logging::Log("[FenixZone AC Bypass] hkSub6C0C12A8 called. Step: %d", g_step);
 		//oTimerFunc(FirstFileA, cFileName, p_Buffer, a4, a5, a6, a7);
 
 		if (g_step == 6)
@@ -552,7 +592,7 @@ namespace te::rce::fz::bypass
 	{
 		if (sig == 0)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Signature for %s not found.", name);
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Signature for %s not found.", name);
 			return false;
 		}
 
@@ -564,7 +604,7 @@ namespace te::rce::fz::bypass
 		error = DetourTransactionBegin();
 		if (error != NO_ERROR)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionBegin failed for %s: %ld", name,
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionBegin failed for %s: %ld", name,
 			                             error);
 			return false;
 		}
@@ -572,7 +612,7 @@ namespace te::rce::fz::bypass
 		error = DetourUpdateThread(GetCurrentThread());
 		if (error != NO_ERROR)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourUpdateThread failed for %s: %ld", name, error);
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourUpdateThread failed for %s: %ld", name, error);
 			DetourTransactionAbort();
 			return false;
 		}
@@ -581,7 +621,7 @@ namespace te::rce::fz::bypass
 		error = DetourAttach(original, hookFunc);
 		if (error != NO_ERROR)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourAttach failed for %s: %ld", name, error);
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourAttach failed for %s: %ld", name, error);
 			DetourTransactionAbort();
 			return false;
 		}
@@ -589,18 +629,18 @@ namespace te::rce::fz::bypass
 		error = DetourTransactionCommit();
 		if (error != NO_ERROR)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionCommit failed for %s: %ld", name,
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionCommit failed for %s: %ld", name,
 			                             error);
 			return false;
 		}
 
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Hooked %s at 0x%p", name, (void*)sig);
+		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Hooked %s at 0x%p", name, (void*)sig);
 		return true;
 	}
 
 	bool FindMethodAndHook()
 	{
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Scanning for signatures...");
+		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Scanning for signatures...");
 
 		uintptr_t sigTerminateGTA = helper::PatternScan(g_mappedBase, SIG_FENIXZONE_CLOSE, false);
 		uintptr_t sigTimerFunc = helper::PatternScan(g_mappedBase, SIG_FENIXZONE_TIMER_FUNC, false);
@@ -612,9 +652,9 @@ namespace te::rce::fz::bypass
 		success &= TryCreateHook("TimerFunc", sigTimerFunc, &hkTimerFunc, reinterpret_cast<LPVOID*>(&oTimerFunc));
 
 		if (success)
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] All hooks attached successfully.");
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] All hooks attached successfully.");
 		else
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] One or more hooks failed.");
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] One or more hooks failed.");
 
 		return success;
 	}
@@ -796,7 +836,7 @@ namespace te::rce::fz::bypass
 
 		if (!SafeVirtualProtect(addr, 3, PAGE_EXECUTE_READWRITE, &oldProtect))
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Failed VirtualProtect on 0x6E2E50.");
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed VirtualProtect on 0x6E2E50.");
 			return;
 		}
 
@@ -806,7 +846,7 @@ namespace te::rce::fz::bypass
 		DWORD dummy;
 		SafeVirtualProtect(addr, 3, oldProtect, &dummy);
 
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Simulated VirtualProtect patch at 0x6E2E50.");
+		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Simulated VirtualProtect patch at 0x6E2E50.");
 	}
 
 	uintptr_t Get_CreateThreadFunction()
@@ -815,14 +855,14 @@ namespace te::rce::fz::bypass
 		uintptr_t match = helper::PatternScan(g_mappedBase, sigCall, false);
 		if (!match)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to find call to CreateThread function.");
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to find call to CreateThread function.");
 			return 0;
 		}
 
 		int32_t relOffset = *reinterpret_cast<int32_t*>(match + 1);
 		uintptr_t targetAddr = match + 5 + relOffset;
 
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Found CreateThread initializer function at: 0x%08X",
+		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Found CreateThread initializer function at: 0x%08X",
 		                             targetAddr);
 		return targetAddr;
 	}
@@ -877,11 +917,11 @@ namespace te::rce::fz::bypass
 			if (match)
 			{
 				sig.resolvedAddress = match;
-				te_sdk::helper::logging::Log("[ThreadSigs] Found %s at 0x%08X", sig.name, match);
+				te::sdk::helper::logging::Log("[ThreadSigs] Found %s at 0x%08X", sig.name, match);
 			}
 			else
 			{
-				te_sdk::helper::logging::Log("[ThreadSigs] Signature not found: %s", sig.name);
+				te::sdk::helper::logging::Log("[ThreadSigs] Signature not found: %s", sig.name);
 			}
 		}
 	}
@@ -906,7 +946,7 @@ namespace te::rce::fz::bypass
 		size_t funcSize = GetFunctionSizeByRetn(funcAddr);
 		if (!funcSize)
 		{
-			te_sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to determine function size.");
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to determine function size.");
 			return;
 		}
 
@@ -921,7 +961,7 @@ namespace te::rce::fz::bypass
 				code[i + 3] == 0x08)
 			{
 				uint32_t paramAddr = *reinterpret_cast<uint32_t*>(&code[i + 4]);
-				//te_sdk::helper::logging::Log("[Debug] Found mov [esp+08], 0x%08X", paramAddr);
+				//te::sdk::helper::logging::Log("[Debug] Found mov [esp+08], 0x%08X", paramAddr);
 
 				for (size_t k = 4; k <= 40; ++k)
 				{
@@ -930,7 +970,7 @@ namespace te::rce::fz::bypass
 						int32_t rel = *reinterpret_cast<int32_t*>(&code[i + k + 1]);
 						uintptr_t callTarget = reinterpret_cast<uintptr_t>(&code[i + k + 5]) + rel;
 
-						//te_sdk::helper::logging::Log("[Debug] Found call to 0x%08X", callTarget);
+						//te::sdk::helper::logging::Log("[Debug] Found call to 0x%08X", callTarget);
 
 						if (paramAddr == targetStartAddress)
 						{
@@ -940,7 +980,7 @@ namespace te::rce::fz::bypass
 								memset(&code[i + k], 0x90, 5);
 								SafeVirtualProtect(&code[i + k], 5, oldProtect, &oldProtect);
 
-								//te_sdk::helper::logging::Log("[Patch] NOPed CreateThread call with StartAddress 0x%08X", targetStartAddress);
+								//te::sdk::helper::logging::Log("[Patch] NOPed CreateThread call with StartAddress 0x%08X", targetStartAddress);
 								++patched;
 							}
 						}
@@ -951,7 +991,7 @@ namespace te::rce::fz::bypass
 			}
 		}
 
-		//te_sdk::helper::logging::Log("[FenixZone AC Bypass] Patched %d CreateThread call(s) by StartAddress.", patched);
+		//te::sdk::helper::logging::Log("[FenixZone AC Bypass] Patched %d CreateThread call(s) by StartAddress.", patched);
 	}
 
 	void Init_CreateThreadPatch()
@@ -968,7 +1008,7 @@ namespace te::rce::fz::bypass
 			Patch_CreateThread_ByStartAddress(funcAddr, sig.resolvedAddress);
 		}
 
-		te_sdk::helper::logging::Log("[FenixZone AC Bypass] Patch CreateThread done.");
+		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Patch CreateThread done.");
 	}
 
 	// Function to scan BitStream for MZ header and save PE executables
@@ -1040,25 +1080,31 @@ namespace te::rce::fz::bypass
 
 			try
 			{
-				auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
-				if (testSig != NULL && g_mappedBase == NULL)
+				//auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
+				//if (testSig != NULL && g_mappedBase == NULL)
+
+				FenixZoneServer server = IdentifyFenixZoneServer(te::sdk::sessionInfo.serverIP);
+				if (server != FenixZoneServer::UNKNOWN && g_mappedBase == NULL)
 				{
-					te_sdk::helper::logging::Log(
+					/*te::sdk::helper::logging::Log(
 						"Detected FenixZone Anti Cheat signature in PE executable (rpcId: %i (%s))", rpcId,
+						rpcName.c_str());*/
+
+					te::sdk::helper::logging::Log("Detected FenixZone server, preparing bypass ... (rpcId: %i (%s))", rpcId,
 						rpcName.c_str());
 
 					ManualMapPE_NoEntry(exeData);
 
-					te_sdk::helper::logging::Log("PE executable mapped successfully, base address: 0x%p", g_mappedBase);
-					te_sdk::helper::logging::Log("Patching Mpress stub...");
+					te::sdk::helper::logging::Log("PE executable mapped successfully, base address: 0x%p", g_mappedBase);
+					te::sdk::helper::logging::Log("Patching Mpress stub...");
 
 					PatchMpressStub();
 
-					te_sdk::helper::logging::Log("Mpress stub patched, calling original DllMain...");
+					te::sdk::helper::logging::Log("Mpress stub patched, calling original DllMain...");
 
 					reinterpret_cast<void(*)()>(g_stubEP)();
 
-					te_sdk::helper::logging::Log("Original DllMain called, bypassing FenixZone Anti Cheat...");
+					te::sdk::helper::logging::Log("Original DllMain called, bypassing FenixZone Anti Cheat...");
 
 					// Now lets fucking bypass this shit
 					{
@@ -1069,7 +1115,7 @@ namespace te::rce::fz::bypass
 
 							CallACRealDllMain();
 
-							te_sdk::helper::logging::Log("FenixZone Anti Cheat bypassed successfully!");
+							te::sdk::helper::logging::Log("FenixZone Anti Cheat bypassed successfully!");
 						}
 					}
 				}
@@ -1078,7 +1124,7 @@ namespace te::rce::fz::bypass
 			}
 			catch (const std::exception& e)
 			{
-				te_sdk::helper::logging::Log("Exception while processing PE executable: %s", e.what());
+				te::sdk::helper::logging::Log("Exception while processing PE executable: %s", e.what());
 			}
 		}
 

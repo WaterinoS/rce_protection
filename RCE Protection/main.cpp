@@ -3,12 +3,12 @@
 #include "te-rce-protection.h"
 #include "FullRaknet/PacketEnumerations.h"
 
-bool OnIncomingRPC(const te_sdk::RpcContext& ctx)
+bool OnIncomingRPC(const te::sdk::RpcContext& ctx)
 {
     return te::rce::helper::CheckRPC(ctx.rpcId, static_cast<BitStream*>(ctx.bitStream));
 }
 
-bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
+bool OnIncomingPacket(const te::sdk::PacketContext& ctx)
 {
     if (ctx.packetId == PacketEnumeration::ID_MARKERS_SYNC)
     {
@@ -23,7 +23,7 @@ bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
         auto expectedMaxBitsSize = (1 + 16 + (3 * 16)) * iNumberOfPlayers;
         if (std::cmp_greater(remainingBitsSize, expectedMaxBitsSize))
         {
-			te_sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bits, expected at most %d bits for %d players.",
+			te::sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in MarkersSync packet: %d bits, expected at most %d bits for %d players.",
 				remainingBitsSize, expectedMaxBitsSize, iNumberOfPlayers);
             return false;
         }
@@ -34,13 +34,13 @@ bool OnIncomingPacket(const te_sdk::PacketContext& ctx)
 
 void Init()
 {
-    while (!te_sdk::InitRakNetHooks())
+    while (!te::sdk::InitRakNetHooks())
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 
-    te_sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
-    te_sdk::RegisterRaknetCallback(HookType::IncomingPacket, OnIncomingPacket);
+    te::sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
+    te::sdk::RegisterRaknetCallback(HookType::IncomingPacket, OnIncomingPacket);
 
 	//printf("[TEST] RakNet hooks initialized.\n");
 }
