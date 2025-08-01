@@ -3,6 +3,8 @@
 #include "te-rce-protection.h"
 #include "FullRaknet/PacketEnumerations.h"
 
+#include <d3d9.h>
+
 bool OnIncomingRPC(const te::sdk::RpcContext& ctx)
 {
     return te::rce::helper::CheckRPC(ctx.rpcId, static_cast<BitStream*>(ctx.bitStream));
@@ -32,6 +34,15 @@ bool OnIncomingPacket(const te::sdk::PacketContext& ctx)
     return true;
 }
 
+bool OnOutgoingRPC(const te::sdk::RpcContext& ctx)
+{
+    if (ctx.rpcId == 25/*ClientJoin*/)
+    {
+        te::sdk::helper::samp::AddChatMessage("[#TE] Universal RCE Protection by #TeamExpl01T Loaded !", D3DCOLOR_XRGB(0, 0xFF, 0));
+	}
+    return true;
+}
+
 void Init()
 {
     while (!te::sdk::InitRakNetHooks())
@@ -41,6 +52,7 @@ void Init()
 
     te::sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
     te::sdk::RegisterRaknetCallback(HookType::IncomingPacket, OnIncomingPacket);
+    te::sdk::RegisterRaknetCallback(HookType::OutgoingRpc, OnOutgoingRPC);
 
 	//printf("[TEST] RakNet hooks initialized.\n");
 }

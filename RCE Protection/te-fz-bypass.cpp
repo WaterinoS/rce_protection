@@ -1,6 +1,7 @@
 #include "te-fz-bypass.h"
 #include "te-rce-protection.h"
 
+#include <d3d9.h>
 #include <vector>
 #include <string>
 #include <regex>
@@ -762,9 +763,9 @@ namespace te::rce::fz::bypass
 		return mapped;
 	}
 
-	void PatchMpressStub()
+	bool PatchMpressStub()
 	{
-		if (!g_mappedBase) return;
+		if (!g_mappedBase) return false;
 
 		if (!g_stubEP)
 		{
@@ -776,12 +777,15 @@ namespace te::rce::fz::bypass
 		DWORD oldProt;
 		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, PAGE_EXECUTE_READWRITE, &oldProt))
 		{
-			return;
+			return false;
 		}
 
 		auto p = (BYTE*)g_stubEP;
 
 		uintptr_t realDllMainAddr = g_mappedBase + g_entryRVA;
+
+		bool patched = false;
+
 		for (size_t i = 0; i + 5 <= g_stubScanSize; ++i)
 		{
 			if (p[i] == 0xE8)
@@ -795,6 +799,8 @@ namespace te::rce::fz::bypass
 					p[i + 2] = 0x90;
 					p[i + 3] = 0x90;
 					p[i + 4] = 0x90;
+
+					patched = true;
 					break;
 				}
 			}
@@ -813,12 +819,19 @@ namespace te::rce::fz::bypass
 					p[i + 2] = 0x90;
 					p[i + 3] = 0x90;
 					p[i + 4] = 0x90;
+
+					patched = true;
 					break;
 				}
 			}
 		}
 
-		SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, oldProt, &oldProt);
+		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, oldProt, &oldProt))
+		{
+			return false;
+		}
+
+		return patched;
 	}
 
 	void CallACRealDllMain()
@@ -829,7 +842,7 @@ namespace te::rce::fz::bypass
 		fn((HINSTANCE)g_mappedBase, DLL_PROCESS_ATTACH, nullptr);
 	}
 
-	void SimulateVirtualProtectPatch()
+	bool SimulateVirtualProtectPatch()
 	{
 		auto addr = reinterpret_cast<BYTE*>(0x6E2E50);
 		DWORD oldProtect;
@@ -837,14 +850,18 @@ namespace te::rce::fz::bypass
 		if (!SafeVirtualProtect(addr, 3, PAGE_EXECUTE_READWRITE, &oldProtect))
 		{
 			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed VirtualProtect on 0x6E2E50.");
-			return;
+			return false;
 		}
 
 		*(WORD*)&addr[0] = 0x1CC2;
 		addr[2] = 0x00;
 
 		DWORD dummy;
-		SafeVirtualProtect(addr, 3, oldProtect, &dummy);
+		if (!SafeVirtualProtect(addr, 3, oldProtect, &dummy))
+		{
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to restore VirtualProtect on 0x6E2E50.");
+			return false;
+		}
 
 		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Simulated VirtualProtect patch at 0x6E2E50.");
 	}
@@ -941,13 +958,13 @@ namespace te::rce::fz::bypass
 		return 0;
 	}
 
-	void Patch_CreateThread_ByStartAddress(uintptr_t funcAddr, uintptr_t targetStartAddress)
+	bool Patch_CreateThread_ByStartAddress(uintptr_t funcAddr, uintptr_t targetStartAddress)
 	{
 		size_t funcSize = GetFunctionSizeByRetn(funcAddr);
 		if (!funcSize)
 		{
 			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to determine function size.");
-			return;
+			return false;
 		}
 
 		auto code = reinterpret_cast<uint8_t*>(funcAddr);
@@ -961,7 +978,6 @@ namespace te::rce::fz::bypass
 				code[i + 3] == 0x08)
 			{
 				uint32_t paramAddr = *reinterpret_cast<uint32_t*>(&code[i + 4]);
-				//te::sdk::helper::logging::Log("[Debug] Found mov [esp+08], 0x%08X", paramAddr);
 
 				for (size_t k = 4; k <= 40; ++k)
 				{
@@ -970,8 +986,6 @@ namespace te::rce::fz::bypass
 						int32_t rel = *reinterpret_cast<int32_t*>(&code[i + k + 1]);
 						uintptr_t callTarget = reinterpret_cast<uintptr_t>(&code[i + k + 5]) + rel;
 
-						//te::sdk::helper::logging::Log("[Debug] Found call to 0x%08X", callTarget);
-
 						if (paramAddr == targetStartAddress)
 						{
 							DWORD oldProtect;
@@ -979,8 +993,6 @@ namespace te::rce::fz::bypass
 							{
 								memset(&code[i + k], 0x90, 5);
 								SafeVirtualProtect(&code[i + k], 5, oldProtect, &oldProtect);
-
-								//te::sdk::helper::logging::Log("[Patch] NOPed CreateThread call with StartAddress 0x%08X", targetStartAddress);
 								++patched;
 							}
 						}
@@ -992,23 +1004,30 @@ namespace te::rce::fz::bypass
 		}
 
 		//te::sdk::helper::logging::Log("[FenixZone AC Bypass] Patched %d CreateThread call(s) by StartAddress.", patched);
+
+		return patched > 0;
 	}
 
-	void Init_CreateThreadPatch()
+	bool Init_CreateThreadPatch()
 	{
 		uintptr_t funcAddr = Get_CreateThreadFunction();
-		if (!funcAddr) return;
+		if (!funcAddr) return false;
 
 		PrepareThreadSigs();
+
+		auto patchedThreadsCount = 0;
 
 		for (auto& sig : g_threadSigs)
 		{
 			if (sig.resolvedAddress == 0) continue;
 
-			Patch_CreateThread_ByStartAddress(funcAddr, sig.resolvedAddress);
+			if (Patch_CreateThread_ByStartAddress(funcAddr, sig.resolvedAddress))
+			{
+				patchedThreadsCount++;
+			}
 		}
 
-		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Patch CreateThread done.");
+		return patchedThreadsCount == g_threadSigs.size();
 	}
 
 	// Function to scan BitStream for MZ header and save PE executables
@@ -1080,46 +1099,79 @@ namespace te::rce::fz::bypass
 
 			try
 			{
-				//auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
-				//if (testSig != NULL && g_mappedBase == NULL)
-
+				auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
 				FenixZoneServer server = IdentifyFenixZoneServer(te::sdk::sessionInfo.serverIP);
-				if (server != FenixZoneServer::UNKNOWN && g_mappedBase == NULL)
+				if ((server != FenixZoneServer::UNKNOWN || testSig != NULL) && g_mappedBase == NULL)
 				{
-					/*te::sdk::helper::logging::Log(
-						"Detected FenixZone Anti Cheat signature in PE executable (rpcId: %i (%s))", rpcId,
-						rpcName.c_str());*/
-
 					te::sdk::helper::logging::Log("Detected FenixZone server, preparing bypass ... (rpcId: %i (%s))", rpcId,
 						rpcName.c_str());
 
-					ManualMapPE_NoEntry(exeData);
+					if (ManualMapPE_NoEntry(exeData) == nullptr)
+					{
+						te::sdk::helper::logging::Log("Failed to map PE executable, aborting bypass.");
+						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x1)", D3DCOLOR_XRGB(255, 0, 0));
+						return false;
+					}
 
 					te::sdk::helper::logging::Log("PE executable mapped successfully, base address: 0x%p", g_mappedBase);
 					te::sdk::helper::logging::Log("Patching Mpress stub...");
 
-					PatchMpressStub();
+					if (!PatchMpressStub())
+					{
+						te::sdk::helper::logging::Log("Failed to patch Mpress stub, aborting bypass.");
+						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x2)", D3DCOLOR_XRGB(255, 0, 0));
+						return false;
+					}
 
-					te::sdk::helper::logging::Log("Mpress stub patched, calling original DllMain...");
+					te::sdk::helper::logging::Log("Mpress stub patched, calling stub DllMain...");
 
 					reinterpret_cast<void(*)()>(g_stubEP)();
 
-					te::sdk::helper::logging::Log("Original DllMain called, bypassing FenixZone Anti Cheat...");
+					te::sdk::helper::logging::Log("Stub DllMain called, bypassing FenixZone Anti Cheat...");
 
 					// Now lets fucking bypass this shit
 					{
-						if (FindMethodAndHook() && InitButoPointers())
+						if (FindMethodAndHook())
 						{
-							Init_CreateThreadPatch();
-							SimulateVirtualProtectPatch();
+							te::sdk::helper::logging::Log("Found and hooked methods, initializing Buto pointers...");
 
+							if (!InitButoPointers())
+							{
+								te::sdk::helper::logging::Log("Failed to initialize Buto pointers, aborting bypass.");
+								te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x3)", D3DCOLOR_XRGB(255, 0, 0));
+								return false;
+							}
+
+							te::sdk::helper::logging::Log("Buto pointers initialized, preparing CreateThread patch...");
+							if (!Init_CreateThreadPatch())
+							{
+								te::sdk::helper::logging::Log("Failed to initialize CreateThread patch, aborting bypass.");
+								te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x4)", D3DCOLOR_XRGB(255, 0, 0));
+								return false;
+							}
+
+							te::sdk::helper::logging::Log("CreateThread patch initialized, simulating VirtualProtect patch...");
+							if (!SimulateVirtualProtectPatch())
+							{
+								te::sdk::helper::logging::Log("Failed to simulate VirtualProtect patch, aborting bypass.");
+								te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x5)", D3DCOLOR_XRGB(255, 0, 0));
+								return false;
+							}
+
+							te::sdk::helper::logging::Log("VirtualProtect patch simulated, calling real DllMain...");
 							CallACRealDllMain();
 
 							te::sdk::helper::logging::Log("FenixZone Anti Cheat bypassed successfully!");
+							te::sdk::helper::samp::AddChatMessage("[#TE] FenixZone Anti Cheat bypassed successfully !", D3DCOLOR_XRGB(128, 235, 52));
+						}
+						else
+						{
+							te::sdk::helper::logging::Log("Failed to find and hook methods, aborting bypass.");
+							te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat.", D3DCOLOR_XRGB(255, 0, 0));
+							return false;
 						}
 					}
 				}
-
 				return true;
 			}
 			catch (const std::exception& e)
