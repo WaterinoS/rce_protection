@@ -45,11 +45,14 @@ bool OnOutgoingRPC(const te::sdk::RpcContext& ctx)
 
 void Init()
 {
+	//printf("[TEST] Initializing RakNet hooks...\n");
+    //system("pause");
     while (!te::sdk::InitRakNetHooks())
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 
+	//printf("[TEST] RakNet hooks initialized, registering callbacks...\n");
     te::sdk::RegisterRaknetCallback(HookType::IncomingRpc, OnIncomingRPC);
     te::sdk::RegisterRaknetCallback(HookType::IncomingPacket, OnIncomingPacket);
     te::sdk::RegisterRaknetCallback(HookType::OutgoingRpc, OnOutgoingRPC);
@@ -63,13 +66,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     {
         // CONSOLE
         {
-            /*
-                AllocConsole();
-                FILE* f;
-                freopen_s(&f, "CONOUT$", "w", stdout);
-                freopen_s(&f, "CONOUT$", "w", stderr);
-                freopen_s(&f, "CONIN$", "r", stdin);
-            */
+        /*
+			AllocConsole();
+            FILE* f;
+            freopen_s(&f, "CONOUT$", "w", stdout);
+            freopen_s(&f, "CONOUT$", "w", stderr);
+            freopen_s(&f, "CONIN$", "r", stdin);
+        */
         }
 
         std::thread(Init).detach();

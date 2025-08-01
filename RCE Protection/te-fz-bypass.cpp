@@ -1030,6 +1030,92 @@ namespace te::rce::fz::bypass
 		return patchedThreadsCount == g_threadSigs.size();
 	}
 
+	bool DumpMappedModule(const std::string& outputPath = "")
+	{
+		if (g_mappedBase == 0)
+		{
+			te::sdk::helper::logging::Log("[DumpMappedModule] No mapped module found (g_mappedBase is 0)");
+			return false;
+		}
+
+		try
+		{
+			// Read PE headers
+			auto* dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(g_mappedBase);
+			if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+			{
+				te::sdk::helper::logging::Log("[DumpMappedModule] Invalid DOS signature");
+				return false;
+			}
+
+			auto* ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(g_mappedBase + dosHeader->e_lfanew);
+			if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+			{
+				te::sdk::helper::logging::Log("[DumpMappedModule] Invalid NT signature");
+				return false;
+			}
+
+			SIZE_T imageSize = ntHeaders->OptionalHeader.SizeOfImage;
+
+			// Generate filename if not provided
+			std::string filename = outputPath;
+			if (filename.empty())
+			{
+				char timestamp[32];
+				time_t now = time(nullptr);
+				strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", localtime(&now));
+				filename = "mapped_module_" + std::string(timestamp) + ".exe";
+			}
+
+			// Create the dump file
+			HANDLE hFile = CreateFileA(filename.c_str(),
+				GENERIC_WRITE,
+				0,
+				nullptr,
+				CREATE_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL,
+				nullptr);
+
+			if (hFile == INVALID_HANDLE_VALUE)
+			{
+				te::sdk::helper::logging::Log("[DumpMappedModule] Failed to create file: %s (Error: %lu)",
+					filename.c_str(), GetLastError());
+				return false;
+			}
+
+			// Write the entire mapped image
+			DWORD bytesWritten = 0;
+			BOOL writeResult = WriteFile(hFile,
+				reinterpret_cast<LPCVOID>(g_mappedBase),
+				static_cast<DWORD>(imageSize),
+				&bytesWritten,
+				nullptr);
+
+			CloseHandle(hFile);
+
+			if (!writeResult || bytesWritten != imageSize)
+			{
+				te::sdk::helper::logging::Log("[DumpMappedModule] Failed to write complete module (Written: %lu/%zu bytes)",
+					bytesWritten, imageSize);
+				return false;
+			}
+
+			te::sdk::helper::logging::Log("[DumpMappedModule] Successfully dumped module to: %s (%zu bytes)",
+				filename.c_str(), imageSize);
+			return true;
+		}
+		catch (const std::exception& e)
+		{
+			te::sdk::helper::logging::Log("[DumpMappedModule] Exception occurred: %s", e.what());
+			return false;
+		}
+		catch (...)
+		{
+			te::sdk::helper::logging::Log("[DumpMappedModule] Unknown exception occurred");
+			return false;
+		}
+	}
+
 	// Function to scan BitStream for MZ header and save PE executables
 	bool ScanForPEExecutable(BitStream* bs, int rpcId, const std::string& rpcName)
 	{
@@ -1128,6 +1214,11 @@ namespace te::rce::fz::bypass
 					reinterpret_cast<void(*)()>(g_stubEP)();
 
 					te::sdk::helper::logging::Log("Stub DllMain called, bypassing FenixZone Anti Cheat...");
+
+					// Dump module in case of patched anticheat
+					//if (DumpMappedModule("fenixzone_ac_dump.dll"))
+					//	return false; // We don't want to continue if we dumped the module
+
 
 					// Now lets fucking bypass this shit
 					{
