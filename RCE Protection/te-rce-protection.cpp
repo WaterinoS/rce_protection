@@ -366,11 +366,10 @@ namespace te::rce::helper
 				auto maxSize = calcSize(rpc, bs);
 				if (maxSize >= 0 && numberOfBits > maxSize)
 				{
-					bool hasPE = te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC");
-					if (hasPE)
-					{
-						return false; // Block - malicious PE executable detected
-					}
+					te::sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in ShowDialog RPC: %d bits, expected at most %d bits.",
+						numberOfBits, maxSize);
+
+					te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC");
 					return false; // Block - possible RCE attempt
 				}
 				break;

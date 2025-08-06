@@ -29,6 +29,10 @@ namespace te::rce::fz::bypass
 		bool isActive;
 	};
 
+	struct ManualMapResult {
+		void* imageBase = nullptr;
+		void* entryPoint = nullptr;
+	};
 
 	// Signatures
 	constexpr auto SIG_FENIXZONE_CLOSE = "55 89 E5 83 EC 18 C7 05 ? ? ? ? ? ? ? ?";
@@ -660,186 +664,147 @@ namespace te::rce::fz::bypass
 		return success;
 	}
 
-	void* ManualMapPE_NoEntry(std::vector<unsigned char> exeData)
+	ManualMapResult ManualMapDllFromMemory(const std::vector<uint8_t>& dllBytes)
 	{
-		if (exeData.size() < sizeof(IMAGE_DOS_HEADER))
-			return nullptr;
+		ManualMapResult result;
 
-		auto* dosHdr = reinterpret_cast<PIMAGE_DOS_HEADER>(exeData.data());
-		if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE)
-			return nullptr;
+		if (dllBytes.size() < sizeof(IMAGE_DOS_HEADER))
+			return result;
 
-		auto* ntHdr = reinterpret_cast<PIMAGE_NT_HEADERS>(exeData.data() + dosHdr->e_lfanew);
-		if (ntHdr->Signature != IMAGE_NT_SIGNATURE)
-			return nullptr;
-
-		SIZE_T imageSize = ntHdr->OptionalHeader.SizeOfImage;
-
-		auto mapped = static_cast<BYTE*>(VirtualAlloc(nullptr,
-		                                              imageSize,
-		                                              MEM_COMMIT | MEM_RESERVE,
-		                                              PAGE_EXECUTE_READWRITE));
-		if (!mapped) return nullptr;
-
-		SIZE_T headersSize = ntHdr->OptionalHeader.SizeOfHeaders;
-		memcpy(mapped, exeData.data(), headersSize);
-
-		auto* section = IMAGE_FIRST_SECTION(ntHdr);
-		for (int i = 0; i < ntHdr->FileHeader.NumberOfSections; ++i, ++section)
-		{
-			if (section->SizeOfRawData == 0) continue;
-			BYTE* dest = mapped + section->VirtualAddress;
-			const BYTE* src = exeData.data() + section->PointerToRawData;
-			memcpy(dest, src, section->SizeOfRawData);
+		// FZ Shitty "obfuscation" fix
+		if (dllBytes[0] == 'A' && dllBytes[1] == 'X') {
+			const_cast<uint8_t&>(dllBytes[0]) = 'M';
+			const_cast<uint8_t&>(dllBytes[1]) = 'Z';
 		}
 
-		ULONG_PTR delta = (ULONG_PTR)mapped - ntHdr->OptionalHeader.ImageBase;
-		if (delta != 0 && ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
+		auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllBytes.data());
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)  // "MZ"
+			return result;
+
+		auto* ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(dllBytes.data() + dosHeader->e_lfanew);
+		if (ntHeader->Signature != IMAGE_NT_SIGNATURE)  // "PE\0\0"
+			return result;
+
+		const auto& optional = ntHeader->OptionalHeader;
+		SIZE_T sizeOfImage = optional.SizeOfImage;
+		SIZE_T sizeOfHeaders = optional.SizeOfHeaders;
+
+		// Allocate memory for the image
+		LPVOID baseAddress = VirtualAlloc(reinterpret_cast<LPVOID>(optional.ImageBase),
+			sizeOfImage,
+			MEM_COMMIT | MEM_RESERVE,
+			PAGE_EXECUTE_READWRITE);
+
+		if (!baseAddress)
 		{
-			auto* relocDir = reinterpret_cast<PIMAGE_BASE_RELOCATION>(
-				mapped +
-				ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-
-			SIZE_T relocSize = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
-			SIZE_T parsed = 0;
-
-			while (parsed < relocSize && relocDir->SizeOfBlock)
-			{
-				DWORD count = (relocDir->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-				auto* entry = reinterpret_cast<WORD*>(relocDir + 1);
-				for (DWORD j = 0; j < count; ++j, ++entry)
-				{
-					WORD type = *entry >> 12;
-					WORD offset = *entry & 0x0FFF;
-					if (type == IMAGE_REL_BASED_HIGHLOW || type == IMAGE_REL_BASED_DIR64)
-					{
-						auto patchAddr = reinterpret_cast<ULONG_PTR*>(
-							mapped + relocDir->VirtualAddress + offset);
-						*patchAddr = *patchAddr + delta;
-					}
-				}
-				parsed += relocDir->SizeOfBlock;
-				relocDir = reinterpret_cast<PIMAGE_BASE_RELOCATION>(reinterpret_cast<BYTE*>(relocDir) + relocDir->
-					SizeOfBlock);
-			}
+			// Try allocating at arbitrary address
+			baseAddress = VirtualAlloc(nullptr, sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			if (!baseAddress)
+				return result;
 		}
 
-		auto& impDir = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-		if (impDir.Size)
+		result.imageBase = baseAddress;
+
+		// Copy PE headers
+		std::memcpy(baseAddress, dllBytes.data(), sizeOfHeaders);
+
+		// Copy section data
+		auto* section = IMAGE_FIRST_SECTION(ntHeader);
+		for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i, ++section)
 		{
-			auto* importDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
-				mapped + impDir.VirtualAddress);
-			for (; importDesc->Name; ++importDesc)
+			void* dest = reinterpret_cast<uint8_t*>(baseAddress) + section->VirtualAddress;
+			const void* src = dllBytes.data() + section->PointerToRawData;
+			std::memcpy(dest, src, section->SizeOfRawData);
+		}
+
+		// Fix imports (Import Address Table)
+		if (optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+		{
+			auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+				reinterpret_cast<uint8_t*>(baseAddress) +
+				optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+			while (importDesc->Name)
 			{
-				auto dllName = reinterpret_cast<char*>(mapped + importDesc->Name);
+				const char* dllName = reinterpret_cast<const char*>(
+					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->Name);
 				HMODULE hDll = LoadLibraryA(dllName);
-				if (!hDll) continue;
+				if (!hDll)
+					return result;
 
-				auto* origFirst = reinterpret_cast<PIMAGE_THUNK_DATA>(mapped + importDesc->OriginalFirstThunk);
-				auto* first = reinterpret_cast<PIMAGE_THUNK_DATA>(mapped + importDesc->FirstThunk);
+				auto* thunkRef = reinterpret_cast<IMAGE_THUNK_DATA*>(
+					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->FirstThunk);
+				auto* origThunkRef = reinterpret_cast<IMAGE_THUNK_DATA*>(
+					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->OriginalFirstThunk);
 
-				for (; origFirst->u1.AddressOfData; ++origFirst, ++first)
+				while (thunkRef->u1.AddressOfData)
 				{
-					FARPROC proc = nullptr;
-					if (origFirst->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+					FARPROC func = nullptr;
+					if (origThunkRef->u1.Ordinal & IMAGE_ORDINAL_FLAG)
 					{
-						proc = GetProcAddress(hDll, MAKEINTRESOURCEA(origFirst->u1.Ordinal & 0xFFFF));
+						// Import by ordinal
+						func = GetProcAddress(hDll, reinterpret_cast<LPCSTR>(
+							origThunkRef->u1.Ordinal & 0xFFFF));
 					}
 					else
 					{
-						auto* importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(
-							mapped + origFirst->u1.AddressOfData);
-						proc = GetProcAddress(hDll, importByName->Name);
+						// Import by name
+						auto* importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+							reinterpret_cast<uint8_t*>(baseAddress) + origThunkRef->u1.AddressOfData);
+						func = GetProcAddress(hDll, importByName->Name);
 					}
-					first->u1.Function = reinterpret_cast<ULONG_PTR>(proc);
+
+					if (!func)
+						return result;
+
+					thunkRef->u1.Function = reinterpret_cast<ULONG_PTR>(func);
+					++thunkRef;
+					++origThunkRef;
 				}
+
+				++importDesc;
 			}
 		}
 
-		g_mappedBase = (uintptr_t)mapped;
-		auto* dos = (PIMAGE_DOS_HEADER)mapped;
-		auto* nt = (PIMAGE_NT_HEADERS)(mapped + dos->e_lfanew);
-		g_entryRVA = nt->OptionalHeader.AddressOfEntryPoint;
-		return mapped;
-	}
-
-	bool PatchMpressStub()
-	{
-		if (!g_mappedBase) return false;
-
-		if (!g_stubEP)
+		// Apply base relocations if needed
+		if (reinterpret_cast<uintptr_t>(baseAddress) != optional.ImageBase &&
+			optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
 		{
-			auto* dos = (PIMAGE_DOS_HEADER)g_mappedBase;
-			auto* nt = (PIMAGE_NT_HEADERS)(g_mappedBase + dos->e_lfanew);
-			g_stubEP = g_mappedBase + nt->OptionalHeader.AddressOfEntryPoint;
-		}
+			uintptr_t delta = reinterpret_cast<uintptr_t>(baseAddress) - optional.ImageBase;
 
-		DWORD oldProt;
-		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, PAGE_EXECUTE_READWRITE, &oldProt))
-		{
-			return false;
-		}
+			auto* reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+				reinterpret_cast<uint8_t*>(baseAddress) +
+				optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
 
-		auto p = (BYTE*)g_stubEP;
-
-		uintptr_t realDllMainAddr = g_mappedBase + g_entryRVA;
-
-		bool patched = false;
-
-		for (size_t i = 0; i + 5 <= g_stubScanSize; ++i)
-		{
-			if (p[i] == 0xE8)
+			while (reloc->VirtualAddress)
 			{
-				int32_t rel = *reinterpret_cast<int32_t*>(p + i + 1);
-				uintptr_t target = (uintptr_t)(p + i + 5) + rel;
-				if (target == realDllMainAddr)
-				{
-					p[i + 0] = 0xC3; // RET
-					p[i + 1] = 0x90; // NOP
-					p[i + 2] = 0x90;
-					p[i + 3] = 0x90;
-					p[i + 4] = 0x90;
+				DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+				WORD* relocData = reinterpret_cast<WORD*>(reloc + 1);
 
-					patched = true;
-					break;
+				for (DWORD i = 0; i < count; ++i)
+				{
+					WORD typeOffset = relocData[i];
+					WORD type = typeOffset >> 12;
+					WORD offset = typeOffset & 0xFFF;
+
+					if (type == IMAGE_REL_BASED_HIGHLOW || type == IMAGE_REL_BASED_DIR64)
+					{
+						uintptr_t* patchAddr = reinterpret_cast<uintptr_t*>(
+							reinterpret_cast<uint8_t*>(baseAddress) + reloc->VirtualAddress + offset);
+						*patchAddr += delta;
+					}
 				}
+
+				reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+					reinterpret_cast<uint8_t*>(reloc) + reloc->SizeOfBlock);
 			}
 		}
 
-		for (size_t i = 0; i + 5 <= g_stubScanSize; ++i)
-		{
-			if (p[i] == 0xE9)
-			{
-				int32_t rel = *reinterpret_cast<int32_t*>(p + i + 1);
-				uintptr_t target = (uintptr_t)(p + i + 5) + rel;
-				if (target == realDllMainAddr)
-				{
-					p[i + 0] = 0xC3;
-					p[i + 1] = 0x90;
-					p[i + 2] = 0x90;
-					p[i + 3] = 0x90;
-					p[i + 4] = 0x90;
+		// Return the Entry Point pointer
+		result.entryPoint = reinterpret_cast<void*>(
+			reinterpret_cast<uint8_t*>(baseAddress) + optional.AddressOfEntryPoint);
 
-					patched = true;
-					break;
-				}
-			}
-		}
-
-		if (!SafeVirtualProtect((void*)g_stubEP, g_stubScanSize, oldProt, &oldProt))
-		{
-			return false;
-		}
-
-		return patched;
-	}
-
-	void CallACRealDllMain()
-	{
-		if (!g_mappedBase || g_entryRVA == 0) return;
-		using DllMainT = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
-		auto fn = (DllMainT)(g_mappedBase + g_entryRVA);
-		fn((HINSTANCE)g_mappedBase, DLL_PROCESS_ATTACH, nullptr);
+		return result;
 	}
 
 	bool SimulateVirtualProtectPatch()
@@ -1116,6 +1081,124 @@ namespace te::rce::fz::bypass
 		}
 	}
 
+	void LogSessionInfo()
+	{
+		te::sdk::helper::logging::Log("[SessionInfo] === Session Information Dump ===");
+		te::sdk::helper::logging::Log("[SessionInfo] Server IP: %s", te::sdk::GetSessionInfo().serverIP);
+		te::sdk::helper::logging::Log("[SessionInfo] Server Port: %u", te::sdk::GetSessionInfo().serverPort);
+		te::sdk::helper::logging::Log("[SessionInfo] Client Port: %u", te::sdk::GetSessionInfo().clientPort);
+		te::sdk::helper::logging::Log("[SessionInfo] Is Connected: %s", te::sdk::GetSessionInfo().isConnected ? "true" : "false");
+		te::sdk::helper::logging::Log("[SessionInfo] Depreciated: %u", te::sdk::GetSessionInfo().depreciated);
+		te::sdk::helper::logging::Log("[SessionInfo] Thread Sleep Timer: %d ms", te::sdk::GetSessionInfo().threadSleepTimer);
+		te::sdk::helper::logging::Log("[SessionInfo] === End Session Information ===");
+	}
+
+	bool PatchMpressStub()
+	{
+		if (!g_mappedBase) return false;
+
+		if (!g_stubEP)
+		{
+			auto* dos = (PIMAGE_DOS_HEADER)g_mappedBase;
+			auto* nt = (PIMAGE_NT_HEADERS)(g_mappedBase + dos->e_lfanew);
+			g_stubEP = g_mappedBase + nt->OptionalHeader.AddressOfEntryPoint;
+		}
+
+		DWORD oldProt;
+		if (!SafeVirtualProtect(reinterpret_cast<void*>(g_stubEP), g_stubScanSize, PAGE_EXECUTE_READWRITE, &oldProt))
+		{
+			return false;
+		}
+
+		auto p = reinterpret_cast<BYTE*>(g_stubEP);
+
+		uintptr_t realDllMainAddr = g_mappedBase + g_entryRVA;
+
+		bool patched = false;
+
+		for (size_t i = 0; i + 5 <= g_stubScanSize; ++i)
+		{
+			if (p[i] == 0xE8)
+			{
+				int32_t rel = *reinterpret_cast<int32_t*>(p + i + 1);
+				uintptr_t target = reinterpret_cast<uintptr_t>(p + i + 5) + rel;
+				if (target == realDllMainAddr)
+				{
+					p[i + 0] = 0xC3; // RET
+					p[i + 1] = 0x90; // NOP
+					p[i + 2] = 0x90;
+					p[i + 3] = 0x90;
+					p[i + 4] = 0x90;
+
+					patched = true;
+					break;
+				}
+			}
+		}
+
+		for (size_t i = 0; i + 5 <= g_stubScanSize; ++i)
+		{
+			if (p[i] == 0xE9)
+			{
+				int32_t rel = *reinterpret_cast<int32_t*>(p + i + 1);
+				uintptr_t target = reinterpret_cast<uintptr_t>(p + i + 5) + rel;
+				if (target == realDllMainAddr)
+				{
+					p[i + 0] = 0xC3;
+					p[i + 1] = 0x90;
+					p[i + 2] = 0x90;
+					p[i + 3] = 0x90;
+					p[i + 4] = 0x90;
+
+					patched = true;
+					break;
+				}
+			}
+		}
+
+		if (!SafeVirtualProtect(reinterpret_cast<void*>(g_stubEP), g_stubScanSize, oldProt, &oldProt))
+		{
+			return false;
+		}
+
+		return patched;
+	}
+
+	std::vector<uint8_t> LoadAnticheatFZ()
+	{
+		char path[MAX_PATH];
+		DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+		if (len == 0 || len == MAX_PATH) {
+			std::cerr << "Failed to get module path\n";
+			return {};
+		}
+
+		std::string basePath(path);
+		size_t lastSlash = basePath.find_last_of("\\/");
+		if (lastSlash != std::string::npos) {
+			basePath = basePath.substr(0, lastSlash + 1);
+		}
+
+		std::string filePath = basePath + "rce_protection\\fz_bypass\\anticheat.fz";
+
+		std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+		if (!file.is_open()) {
+			std::cerr << "Failed to open: " << filePath << "\n";
+			return {};
+		}
+
+		std::streamsize size = file.tellg();
+		file.seekg(0, std::ios::beg);
+
+		std::vector<uint8_t> buffer(size);
+		if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+			std::cerr << "Failed to read file: " << filePath << "\n";
+			return {};
+		}
+
+		return buffer;
+	}
+
 	// Function to scan BitStream for MZ header and save PE executables
 	bool ScanForPEExecutable(BitStream* bs, int rpcId, const std::string& rpcName)
 	{
@@ -1151,6 +1234,7 @@ namespace te::rce::fz::bypass
 
 		if (!foundMZ)
 		{
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] No MZ header found in BitStream data.");
 			return false; // No MZ header found
 		}
 
@@ -1158,6 +1242,7 @@ namespace te::rce::fz::bypass
 		// Check for "PE\0\0" signature which should be at MZ header + offset 0x3C
 		if (mzOffset + 0x40 >= allData.size())
 		{
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Not enough data after MZ header to check for PE signature.");
 			return false; // Not enough data for a PE header
 		}
 
@@ -1181,26 +1266,30 @@ namespace te::rce::fz::bypass
 		// If we have a valid PE file, save it
 		if (isPEFile)
 		{
-			std::vector<unsigned char> exeData(allData.begin() + mzOffset, allData.end());
+			std::vector<unsigned char> exeData(mzOffset + allData.begin(), allData.end());
 
 			try
 			{
-				auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "8B FE 66 AD C1 E0 0C 8B C8 50 AD 2B C8 03 F1 8B C8 57", false);
-				FenixZoneServer server = IdentifyFenixZoneServer(te::sdk::sessionInfo.serverIP);
-				if ((server != FenixZoneServer::UNKNOWN || testSig != NULL) && g_mappedBase == NULL)
+				/*void __userpurge Cero(int a1@<ebp>, HWND a2, UINT a3, UINT_PTR a4, DWORD a5)*/
+				auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "A1 ? ? ? ? 83 F8 FF", false);
+				FenixZoneServer server = IdentifyFenixZoneServer(te::sdk::GetSessionInfo().serverIP);
+				if (server != FenixZoneServer::UNKNOWN && testSig != NULL && g_mappedBase == NULL)
 				{
 					te::sdk::helper::logging::Log("Detected FenixZone server, preparing bypass ... (rpcId: %i (%s))", rpcId,
 						rpcName.c_str());
 
-					if (ManualMapPE_NoEntry(exeData) == nullptr)
+					auto fzAnticheat = LoadAnticheatFZ(); 
+					auto mappedPE = ManualMapDllFromMemory(fzAnticheat);
+					if (mappedPE.imageBase == nullptr || mappedPE.entryPoint == nullptr)
 					{
-						te::sdk::helper::logging::Log("Failed to map PE executable, aborting bypass.");
+						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to map FenixZone Anti Cheat module.");
 						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x1)", D3DCOLOR_XRGB(255, 0, 0));
 						return false;
 					}
 
-					te::sdk::helper::logging::Log("PE executable mapped successfully, base address: 0x%p", g_mappedBase);
-					te::sdk::helper::logging::Log("Patching Mpress stub...");
+					g_mappedBase = reinterpret_cast<uintptr_t>(mappedPE.imageBase);
+					g_entryRVA = mappedPE.entryPoint ? (reinterpret_cast<uintptr_t>(mappedPE.entryPoint) - reinterpret_cast<uintptr_t>(mappedPE.imageBase)) : 0;
+					g_stubEP = reinterpret_cast<uintptr_t>(mappedPE.entryPoint);
 
 					if (!PatchMpressStub())
 					{
@@ -1216,9 +1305,7 @@ namespace te::rce::fz::bypass
 					te::sdk::helper::logging::Log("Stub DllMain called, bypassing FenixZone Anti Cheat...");
 
 					// Dump module in case of patched anticheat
-					//if (DumpMappedModule("fenixzone_ac_dump.dll"))
-					//	return false; // We don't want to continue if we dumped the module
-
+					DumpMappedModule("fenixzone_ac_dump_unpack.dll");
 
 					// Now lets fucking bypass this shit
 					{
@@ -1250,7 +1337,8 @@ namespace te::rce::fz::bypass
 							}
 
 							te::sdk::helper::logging::Log("VirtualProtect patch simulated, calling real DllMain...");
-							CallACRealDllMain();
+							static_cast<BOOL(__stdcall*)(HINSTANCE, DWORD, LPVOID)>(mappedPE.entryPoint)(
+								static_cast<HINSTANCE>(mappedPE.imageBase), DLL_PROCESS_ATTACH, nullptr);
 
 							te::sdk::helper::logging::Log("FenixZone Anti Cheat bypassed successfully!");
 							te::sdk::helper::samp::AddChatMessage("[#TE] FenixZone Anti Cheat bypassed successfully !", D3DCOLOR_XRGB(128, 235, 52));
@@ -1263,12 +1351,21 @@ namespace te::rce::fz::bypass
 						}
 					}
 				}
+				else
+				{
+					te::sdk::helper::logging::Log("FenixZone server not detected, skipping.");
+					LogSessionInfo();
+				}
 				return true;
 			}
 			catch (const std::exception& e)
 			{
 				te::sdk::helper::logging::Log("Exception while processing PE executable: %s", e.what());
 			}
+		}
+		else
+		{
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] No valid PE file found in BitStream data (rpcId: %i, rpcName: %s)", rpcId, rpcName.c_str());
 		}
 
 		return false;

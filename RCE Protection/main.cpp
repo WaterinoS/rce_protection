@@ -39,6 +39,17 @@ bool OnOutgoingRPC(const te::sdk::RpcContext& ctx)
     if (ctx.rpcId == 25/*ClientJoin*/)
     {
         te::sdk::helper::samp::AddChatMessage("[#TE] Universal RCE Protection by #TeamExpl01T Loaded !", D3DCOLOR_XRGB(0, 0xFF, 0));
+
+        auto& info = te::sdk::GetSessionInfo();
+        if (strlen(info.serverIP) == 0)
+        {
+            auto serverId = te::sdk::LocalClient->GetInterface()->GetServerID();
+
+            in_addr in;
+            in.s_addr = serverId.binaryAddress;
+            strcpy_s(info.serverIP, inet_ntoa(in));
+			info.serverPort = serverId.port;
+        }
 	}
     return true;
 }
