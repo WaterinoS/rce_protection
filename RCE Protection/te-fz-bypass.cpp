@@ -34,6 +34,9 @@ namespace te::rce::fz::bypass
 	uintptr_t g_stubScanSize = 0x300;
 	ChatPushHook g_chatPushHook;
 
+	typedef int(__cdecl* SendCommandFunc)(int);
+	SendCommandFunc g_sendCommand = nullptr;
+
 	// Other
 	std::unordered_map<std::string, PatternData> s_patternCache;
 	static std::recursive_mutex g_memoryProtectionMutex;
@@ -263,6 +266,96 @@ namespace te::rce::fz::bypass
 		return input;
 	}
 
+	FARPROC GetExportedFunction(void* moduleBase, const char* functionName)
+	{
+		if (!moduleBase || !functionName) {
+			return nullptr;
+		}
+
+		__try {
+			auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase);
+			if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+				sdk::helper::logging::Log("[GetExportedFunction] Invalid DOS signature");
+				return nullptr;
+			}
+
+			auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS*>(
+				reinterpret_cast<uint8_t*>(moduleBase) + dosHeader->e_lfanew);
+			if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+				sdk::helper::logging::Log("[GetExportedFunction] Invalid NT signature");
+				return nullptr;
+			}
+
+			// Check if export directory exists
+			DWORD exportDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+			DWORD exportDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+
+			if (exportDirRVA == 0 || exportDirSize == 0) {
+				sdk::helper::logging::Log("[GetExportedFunction] No export directory found");
+				return nullptr;
+			}
+
+			auto* exportDir = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(
+				reinterpret_cast<uint8_t*>(moduleBase) + exportDirRVA);
+
+			// Get arrays
+			DWORD* nameArray = reinterpret_cast<DWORD*>(
+				reinterpret_cast<uint8_t*>(moduleBase) + exportDir->AddressOfNames);
+			DWORD* addressArray = reinterpret_cast<DWORD*>(
+				reinterpret_cast<uint8_t*>(moduleBase) + exportDir->AddressOfFunctions);
+			WORD* ordinalArray = reinterpret_cast<WORD*>(
+				reinterpret_cast<uint8_t*>(moduleBase) + exportDir->AddressOfNameOrdinals);
+
+			sdk::helper::logging::Log("[GetExportedFunction] Searching for '%s' in %u exported functions",
+			                          functionName, exportDir->NumberOfNames);
+
+			// Search for the function by name
+			for (DWORD i = 0; i < exportDir->NumberOfNames; ++i) {
+				const char* exportName = reinterpret_cast<const char*>(
+					reinterpret_cast<uint8_t*>(moduleBase) + nameArray[i]);
+
+				sdk::helper::logging::Log("[GetExportedFunction] Export[%u]: %s", i, exportName);
+
+				if (strcmp(exportName, functionName) == 0) {
+					WORD ordinal = ordinalArray[i];
+					DWORD functionRVA = addressArray[ordinal];
+
+					void* functionAddr = reinterpret_cast<uint8_t*>(moduleBase) + functionRVA;
+
+					sdk::helper::logging::Log("[GetExportedFunction] Found '%s' at ordinal %u, RVA 0x%X, address 0x%p",
+					                          functionName, ordinal, functionRVA, functionAddr);
+
+					return reinterpret_cast<FARPROC>(functionAddr);
+				}
+			}
+
+			sdk::helper::logging::Log("[GetExportedFunction] Function '%s' not found", functionName);
+			return nullptr;
+
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			sdk::helper::logging::Log("[GetExportedFunction] Exception occurred while searching for '%s'", functionName);
+			return nullptr;
+		}
+	}
+
+	int SafeCallSendCommand(int parameter)
+	{
+		if (!g_sendCommand) {
+			sdk::helper::logging::Log("[SendCommand] Function not available");
+			return -1;
+		}
+
+		__try {
+			int result = g_sendCommand(parameter);
+			return result;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			sdk::helper::logging::Log("[SendCommand] Exception occurred during SendCommand call");
+			return -1;
+		}
+	}
+
 	int __stdcall HookedChatPush(int a1)
 	{
 		if (a1 != 0) {
@@ -272,10 +365,10 @@ namespace te::rce::fz::bypass
 			if (SafeExtractString(a1, buffer, sizeof(buffer), &actualLength)) {
 				std::string command = std::string(buffer, actualLength);
 				command = SpoofCommandHWData(command);
-
 				te::sdk::helper::logging::Log("[FenixZone AC Bypass] Processed command: %s", command.c_str());
 
-				return SafeCallOriginalFunction(g_chatPushHook.trampoline, reinterpret_cast<int>(command.c_str()));
+				SafeCallSendCommand(reinterpret_cast<int>(command.c_str()));
+				return 1;
 			}
 		}
 
@@ -1142,6 +1235,11 @@ namespace te::rce::fz::bypass
 						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to map FenixZone Anti Cheat communication module.");
 						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x1)", D3DCOLOR_XRGB(255, 0, 0));
 						return false;
+					}
+
+					FARPROC sendCommandAddr = GetExportedFunction(mappedPEComm.imageBase, "SendCommand");
+					if (sendCommandAddr) {
+						g_sendCommand = reinterpret_cast<SendCommandFunc>(sendCommandAddr);
 					}
 
 					if (!Patch_AllCreateThreadInFunction(reinterpret_cast<uintptr_t>(mappedPEComm.entryPoint)))
