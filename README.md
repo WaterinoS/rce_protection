@@ -11,6 +11,6 @@ Includes also FZ Bypass feature
 # Credits
 - **WaterSmoke (Expl01T3R)** – Main Coder & Analysis  
 - **CikaDjokica (CikaEU)** – Help with analysis & crack  
-- **SobFox** – Help with analysis & crack  
+- **SobFoX** – Help with analysis & crack  
 - **roxery** – Testing  
 - **Reshawn** – Testing  
