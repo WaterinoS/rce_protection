@@ -5,55 +5,156 @@
 #include <vector>
 #include <string>
 #include <regex>
+#include <fstream>
 
 #include "Detours/detours_x86.h"
 #pragma comment(lib, "Detours/detours_x86.lib")
 
 namespace te::rce::fz::bypass
 {
+	// ---------- Core Structures ----------
 	struct ManualMapResult {
 		void* imageBase = nullptr;
 		void* entryPoint = nullptr;
+		size_t imageSize = 0;
 	};
 
-	struct ChatPushHook {
-		uintptr_t originalFunction = 0;
-		uintptr_t hookFunction = 0;
-		BYTE originalBytes[32] = { 0 };
-		BYTE* trampoline = nullptr;
-		bool isHooked = false;
-	};
+	// ---------- Signatures ----------
+	constexpr const char* SIG_FENIXZONE_CHAT_PUSH = "55 0F BA FD 27 F5 89 E5 57 F9 66 F7 C6 ? ? 3B D6 56 8D B5 ? ? ? ? E9 ? ? ? ?";
+	constexpr const char* SIG_SERVER_COMMUNICATION = "FF 74 24 10 9D 8D 64 24 1C E8 ? ? ? ? 0F 84";
+	constexpr const char* SIG_MESSAGE_NUMBER = "C7 05 ? ? ? ? ? ? ? ? E8 ? ? ? ? C7 44 24";
 
-	// Signatures
-	constexpr auto SIG_FENIXZONE_CHAT_PUSH = "55 0F BA FD 27 F5 89 E5 57 F9 66 F7 C6 ? ? 3B D6 56 8D B5 ? ? ? ? E9 ? ? ? ?";
+	// ---------- Function Pointers ----------
+	using SendCommandFunc = int(__cdecl*)(const char*);
+	using ChatPushFunc = int(__stdcall*)(int);
+	using ServerCommFunc = void(__cdecl*)(void);
+	using WriteFileFunc = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+	using ExitProcessFunc = VOID(WINAPI*)(UINT);
+	using TerminateProcessFunc = BOOL(WINAPI*)(HANDLE, UINT);
 
-	// Global variables
-	uintptr_t g_mappedBase = 0;
-	uintptr_t g_entryRVA = 0;
-	uintptr_t g_stubEP = 0;
-	uintptr_t g_stubScanSize = 0x300;
-	ChatPushHook g_chatPushHook;
+	// ---------- Global Variables ----------
+	static SendCommandFunc g_SendCommand = nullptr;
+	static ChatPushFunc g_ChatPush_Orig = nullptr;
+	static ServerCommFunc g_ServerComm_Orig = nullptr;
+	static WriteFileFunc g_WriteFile_Orig = nullptr;
+	static ExitProcessFunc g_ExitProcess_Orig = nullptr;
+	static TerminateProcessFunc g_TerminateProcess_Orig = nullptr;
 
-	typedef int(__cdecl* SendCommandFunc)(int);
-	SendCommandFunc g_sendCommand = nullptr;
-
-	// Other
-	std::unordered_map<std::string, PatternData> s_patternCache;
 	static std::recursive_mutex g_memoryProtectionMutex;
 
+	// ---------- Pattern Scanning ----------
+	static std::vector<int> SigToBytes(const char* s)
+	{
+		std::vector<int> out;
+		out.reserve(64);
+		for (; *s; )
+		{
+			if (*s == ' ') { ++s; continue; }
+			if (*s == '?') {
+				out.push_back(-1);
+				if (*(s + 1) == '?') ++s;
+				++s;
+				continue;
+			}
+			if (isxdigit((unsigned char)s[0]) && isxdigit((unsigned char)s[1]))
+			{
+				char b[3] = { s[0], s[1], 0 };
+				out.push_back(strtoul(b, nullptr, 16));
+				s += 2;
+			}
+			else { ++s; }
+		}
+		return out;
+	}
+
+	static uintptr_t FindInSection(uint8_t* start, size_t len, const char* sig)
+	{
+		auto pat = SigToBytes(sig);
+		const size_t n = pat.size();
+		if (!n || len < n) return 0;
+
+		for (size_t i = 0; i <= len - n; ++i)
+		{
+			bool ok = true;
+			for (size_t j = 0; j < n; ++j)
+			{
+				if (pat[j] != -1 && start[i + j] != (uint8_t)pat[j]) {
+					ok = false;
+					break;
+				}
+			}
+			if (ok) return (uintptr_t)(start + i);
+		}
+		return 0;
+	}
+
+	static uintptr_t PatternScanModule(HMODULE hMod, const char* sig)
+	{
+		if (!hMod) return 0;
+		auto* dos = (IMAGE_DOS_HEADER*)hMod;
+		auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)hMod + dos->e_lfanew);
+		auto* sec = IMAGE_FIRST_SECTION(nt);
+
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+		{
+			if (memcmp(sec->Name, ".text", 5) && memcmp(sec->Name, ".60C", 4)) continue;
+			uint8_t* base = (uint8_t*)hMod + sec->VirtualAddress;
+			uintptr_t hit = FindInSection(base, sec->Misc.VirtualSize, sig);
+			if (hit) return hit;
+		}
+		return 0;
+	}
+
+	// ---------- File I/O ----------
+	static bool ReadFileToVector(const std::string& path, std::vector<uint8_t>& out, const char* tag)
+	{
+		out.clear();
+		std::ifstream f(path, std::ios::binary | std::ios::ate);
+		if (!f) {
+			te::sdk::helper::logging::Log("[%s] Failed to open: %s", tag, path.c_str());
+			return false;
+		}
+
+		std::streamsize sz = f.tellg();
+		if (sz <= 0) {
+			te::sdk::helper::logging::Log("[%s] Empty file: %s", tag, path.c_str());
+			return false;
+		}
+
+		out.resize(static_cast<size_t>(sz));
+		f.seekg(0, std::ios::beg);
+		if (!f.read(reinterpret_cast<char*>(out.data()), sz)) {
+			te::sdk::helper::logging::Log("[%s] Read failed: %s", tag, path.c_str());
+			out.clear();
+			return false;
+		}
+
+		te::sdk::helper::logging::Log("[%s] Loaded %zu bytes from %s", tag, out.size(), path.c_str());
+		return true;
+	}
+
+	// ---------- Safe Memory Operations ----------
 	bool SafeVirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect)
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_memoryProtectionMutex);
 		return VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect) != FALSE;
 	}
 
+	BOOL SafeReadMemory(void* address, void* buffer, size_t size)
+	{
+		__try {
+			memcpy(buffer, address, size);
+			return TRUE;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return FALSE;
+		}
+	}
+
 	BOOL SafeExtractString(int address, char* buffer, size_t bufferSize, size_t* actualLength)
 	{
 		*actualLength = 0;
-
-		if (address == 0 || bufferSize == 0) {
-			return FALSE;
-		}
+		if (address == 0 || bufferSize == 0) return FALSE;
 
 		__try {
 			MEMORY_BASIC_INFORMATION mbi;
@@ -79,119 +180,40 @@ namespace te::rce::fz::bypass
 		}
 	}
 
-	int SafeCallOriginalFunction(void* trampoline, int parameter)
+	BOOL SafeCallDllMain(void* entryPoint, void* base)
 	{
-		if (!trampoline) {
-			return -1;
-		}
+		if (!entryPoint || !base) return FALSE;
+		typedef BOOL(WINAPI* DllMainT)(HINSTANCE, DWORD, LPVOID);
+		DllMainT DllMainFn = reinterpret_cast<DllMainT>(entryPoint);
 
+		BOOL ok = FALSE;
 		__try {
-			MEMORY_BASIC_INFORMATION mbi;
-			if (!VirtualQuery(trampoline, &mbi, sizeof(mbi)) ||
-				mbi.State != MEM_COMMIT ||
-				!(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-				return -1;
-			}
-
-			typedef int(__stdcall* OriginalChatPushFunc)(int);
-			OriginalChatPushFunc originalFunc = reinterpret_cast<OriginalChatPushFunc>(trampoline);
-
-			return originalFunc(parameter);
+			ok = DllMainFn(reinterpret_cast<HINSTANCE>(base), DLL_PROCESS_ATTACH, nullptr);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
-			return -1;
+			te::sdk::helper::logging::Log("[DllMain] Exception occurred during DllMain execution");
+			ok = FALSE;
 		}
+		return ok;
 	}
 
-	std::string RandomHex()
+	// ---------- Hardware Spoofing ----------
+	std::string GenerateRandomHardwareData()
 	{
-		std::stringstream ss;
-		ss << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << (rand() & 0xFFFFFFFF);
-		return ss.str();
-	}
+		srand((unsigned)time(nullptr));
+		auto spoof = [](int base, int delta) { return base + (rand() % (2 * delta + 1) - delta); };
 
-	std::string RandomMonitorID()
-	{
-		static const char* vendors[] = {"AUO", "CMN", "LGD", "SHP", "BOE"};
-		int vendorIdx = rand() % 5;
-		int code = 1000 + rand() % 9000;
-		return vendors[vendorIdx] + std::to_string(code);
-	}
+		int vramKB = spoof(16609312, 512);
+		int ramGB = spoof(12, 1);
+		int cores = spoof(12, 1);
+		int threads = spoof(5, 1);
+		unsigned hwid = (unsigned)spoof(0x000A0671, 0x10);
 
-	std::string RandomResolution()
-	{
-		static const char* resolutions[] = {"1920X1080", "2560X1440", "1366X768", "1600X900", "3440X1440"};
-		return resolutions[rand() % 5];
-	}
+		char buffer[512];
+		_snprintf_s(buffer, _TRUNCATE,
+			"NVIDIA GeForce RTX 3060 Ti %d KB %d 4-0-%d-%d 11th Gen Intel(R) Core(TM) i5-11400F @ 2.60GHz 0x%08X 0xBFEBFBFF 0x7FFAFBBF",
+			vramKB, ramGB, cores, threads, hwid);
 
-	std::string RandomRAM()
-	{
-		int ramMb = (8 + rand() % 24) * 1024;
-		return std::to_string(ramMb * 1024) + " KB";
-	}
-
-	std::string RandomCPU()
-	{
-		static const char* cpus[] = {
-			"Intel(R) Core(TM) i9-14900K", "AMD Ryzen 9 5900X",
-			"Intel(R) Core(TM) i5-12600H", "AMD Ryzen 7 7840HS"
-		};
-		return cpus[rand() % 4];
-	}
-
-	bool IsSpoofableCommand(const std::string& line)
-	{
-		std::regex pattern(R"(\/(buto|quto).*?0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8})");
-		return std::regex_search(line, pattern);
-	}
-
-	std::string ReplaceHexWithRandom(const std::string& input)
-	{
-		std::smatch match;
-		std::regex hexRegex(R"(0x[0-9A-Fa-f]{8})");
-		std::string result;
-		auto searchStart(input.cbegin());
-
-		while (std::regex_search(searchStart, input.cend(), match, hexRegex))
-		{
-			result.append(searchStart, match[0].first);
-			result.append(RandomHex());
-			searchStart = match[0].second;
-		}
-		result.append(searchStart, input.cend());
-		return result;
-	}
-
-	std::string GetRandomDisplayDevice()
-	{
-		static const char* displayDevices[] = {
-			"NVIDIA GeForce RTX 4080", "AMD Radeon RX 7900 XTX",
-			"NVIDIA GeForce RTX 3070", "AMD Radeon RX 6800 XT",
-			"NVIDIA GeForce GTX 1660 Ti", "AMD Radeon RX 5700 XT"
-		};
-		return displayDevices[rand() % 6];
-	}
-
-	std::string GetRandomCPUBrand()
-	{
-		char cpuBrand[48] = {};
-		// Simulate random CPU brand string from CPUID
-		static const char* brands[] = {
-			"GenuineIntel", "AuthenticAMD", "CentaurHauls"
-		};
-		strcpy(cpuBrand, brands[rand() % 3]);
-		return std::string(cpuBrand);
-	}
-
-	std::string GenerateRandomCPUID()
-	{
-		// Generate random CPUID values similar to the assembly function
-		uint32_t eax = 0x00000001 + (rand() & 0xFFFF);
-		uint32_t edx = 0x078BFBFF + (rand() & 0xFFFF);
-		uint32_t ecx = 0x7FFAFBBF + (rand() & 0xFFFF);
-
-		char buffer[64];
-		snprintf(buffer, sizeof(buffer), "0x%08X 0x%08X 0x%08X", eax, edx, ecx);
 		return std::string(buffer);
 	}
 
@@ -199,55 +221,18 @@ namespace te::rce::fz::bypass
 	{
 		try
 		{
-			if (!IsSpoofableCommand(input))
-			{
-				return input;
-			}
+			std::regex pattern(R"(\/(buto|quto).*?0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8})");
+			if (!std::regex_search(input, pattern)) return input;
 
 			std::string output = input;
 
-			// Spoof display device information (like EnumDisplayDevicesA)
+			// Apply hardware spoofing transformations
 			output = std::regex_replace(output,
-			                            std::regex(R"(\b(?:NVIDIA|AMD|Intel).*?(?:RTX|GTX|Radeon|Arc).*?\b)"),
-			                            GetRandomDisplayDevice());
+				std::regex(R"(\b(?:NVIDIA|AMD|Intel).*?(?:RTX|GTX|Radeon|Arc).*?\b)"),
+				"NVIDIA GeForce RTX 3060 Ti");
 
-			// Spoof memory information (like GlobalMemoryStatusEx)
-			output = std::regex_replace(output, std::regex(R"(\b\d{7,9} KB\b)"), RandomRAM());
-
-			// Spoof processor count (like GetSystemInfo)
-			output = std::regex_replace(output,
-			                            std::regex(R"(\b(\d{1,2})(?= \d{1,2}-\d{1,2}-\d{1,2}-\d{1,2}))"),
-			                            std::to_string(4 + rand() % 13)); // 4-16 processors
-
-			// Spoof keyboard type information (like GetKeyboardType calls)
-			output = std::regex_replace(output,
-			                            std::regex(R"(\b\d{1,2}-\d{1,2}-\d{1,2}-\d{1,2}\b)"),
-			                            std::to_string(4 + rand() % 4) + "-" + // Keyboard type (4-7)
-			                            std::to_string(rand() % 12) + "-" + // Keyboard subtype (0-11)
-			                            std::to_string(1 + rand() % 12) + "-" + // Function keys (1-12)
-			                            std::to_string(43 + rand() % 10)); // System metrics variation
-
-			// Spoof CPU brand string (from CPUID)
-			output = std::regex_replace(output,
-			                            std::regex(R"(\b(?:GenuineIntel|AuthenticAMD|CentaurHauls)\b)"),
-			                            GetRandomCPUBrand());
-
-			// Spoof CPU model information
-			output = std::regex_replace(output,
-			                            std::regex(R"((\d+(?:th)? Gen .+? Core\(TM\) .+?))"),
-			                            RandomCPU());
-
-			// Spoof CPUID register values (the 0x08X format from assembly)
-			output = std::regex_replace(output,
-			                            std::regex(R"(0x[0-9A-Fa-f]{8} 0x[0-9A-Fa-f]{8} 0x[0-9A-Fa-f]{8})"),
-			                            GenerateRandomCPUID());
-
-			// Spoof individual hex values
-			output = ReplaceHexWithRandom(output);
-
-			// Spoof monitor information
-			output = std::regex_replace(output, std::regex(R"(\b[A-Z]{3}\d{4}\b)"), RandomMonitorID());
-			output = std::regex_replace(output, std::regex(R"(\b\d{3,4}X\d{3,4}\b)"), RandomResolution());
+			// Spoof memory information
+			output = std::regex_replace(output, std::regex(R"(\b\d{7,9} KB\b)"), "16609312 KB");
 
 			return output;
 		}
@@ -266,99 +251,83 @@ namespace te::rce::fz::bypass
 		return input;
 	}
 
+	// ---------- Export Resolution ----------
 	FARPROC GetExportedFunction(void* moduleBase, const char* functionName)
 	{
-		if (!moduleBase || !functionName) {
-			return nullptr;
+		if (!moduleBase || !functionName || !*functionName) return nullptr;
+
+		auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(moduleBase);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+		auto nt = reinterpret_cast<PIMAGE_NT_HEADERS32>((uint8_t*)moduleBase + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+		auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+		if (!dir.VirtualAddress || !dir.Size) return nullptr;
+
+		auto exp = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>((uint8_t*)moduleBase + dir.VirtualAddress);
+		auto names = reinterpret_cast<DWORD*>((uint8_t*)moduleBase + exp->AddressOfNames);
+		auto funcs = reinterpret_cast<DWORD*>((uint8_t*)moduleBase + exp->AddressOfFunctions);
+		auto ords = reinterpret_cast<WORD*>((uint8_t*)moduleBase + exp->AddressOfNameOrdinals);
+
+		for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+			const char* name = reinterpret_cast<const char*>((uint8_t*)moduleBase + names[i]);
+			if (lstrcmpA(name, functionName) == 0) {
+				WORD ord = ords[i];
+				DWORD rva = funcs[ord];
+				return (FARPROC)((uint8_t*)moduleBase + rva);
+			}
 		}
-
-		__try {
-			auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase);
-			if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-				sdk::helper::logging::Log("[GetExportedFunction] Invalid DOS signature");
-				return nullptr;
-			}
-
-			auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS*>(
-				reinterpret_cast<uint8_t*>(moduleBase) + dosHeader->e_lfanew);
-			if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-				sdk::helper::logging::Log("[GetExportedFunction] Invalid NT signature");
-				return nullptr;
-			}
-
-			// Check if export directory exists
-			DWORD exportDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-			DWORD exportDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
-
-			if (exportDirRVA == 0 || exportDirSize == 0) {
-				sdk::helper::logging::Log("[GetExportedFunction] No export directory found");
-				return nullptr;
-			}
-
-			auto* exportDir = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(
-				reinterpret_cast<uint8_t*>(moduleBase) + exportDirRVA);
-
-			// Get arrays
-			DWORD* nameArray = reinterpret_cast<DWORD*>(
-				reinterpret_cast<uint8_t*>(moduleBase) + exportDir->AddressOfNames);
-			DWORD* addressArray = reinterpret_cast<DWORD*>(
-				reinterpret_cast<uint8_t*>(moduleBase) + exportDir->AddressOfFunctions);
-			WORD* ordinalArray = reinterpret_cast<WORD*>(
-				reinterpret_cast<uint8_t*>(moduleBase) + exportDir->AddressOfNameOrdinals);
-
-			sdk::helper::logging::Log("[GetExportedFunction] Searching for '%s' in %u exported functions",
-			                          functionName, exportDir->NumberOfNames);
-
-			// Search for the function by name
-			for (DWORD i = 0; i < exportDir->NumberOfNames; ++i) {
-				const char* exportName = reinterpret_cast<const char*>(
-					reinterpret_cast<uint8_t*>(moduleBase) + nameArray[i]);
-
-				sdk::helper::logging::Log("[GetExportedFunction] Export[%u]: %s", i, exportName);
-
-				if (strcmp(exportName, functionName) == 0) {
-					WORD ordinal = ordinalArray[i];
-					DWORD functionRVA = addressArray[ordinal];
-
-					void* functionAddr = reinterpret_cast<uint8_t*>(moduleBase) + functionRVA;
-
-					sdk::helper::logging::Log("[GetExportedFunction] Found '%s' at ordinal %u, RVA 0x%X, address 0x%p",
-					                          functionName, ordinal, functionRVA, functionAddr);
-
-					return reinterpret_cast<FARPROC>(functionAddr);
-				}
-			}
-
-			sdk::helper::logging::Log("[GetExportedFunction] Function '%s' not found", functionName);
-			return nullptr;
-
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			sdk::helper::logging::Log("[GetExportedFunction] Exception occurred while searching for '%s'", functionName);
-			return nullptr;
-		}
+		return nullptr;
 	}
 
-	int SafeCallSendCommand(int parameter)
+	static SendCommandFunc ResolveSendCommand(HMODULE hMod)
 	{
-		if (!g_sendCommand) {
-			sdk::helper::logging::Log("[SendCommand] Function not available");
-			return -1;
+		if (!hMod) return nullptr;
+
+		FARPROC p = GetExportedFunction(hMod, "SendCommand");
+		if (p) {
+			te::sdk::helper::logging::Log("[SendCommand] Found export 'SendCommand' at %p", p);
+			return (SendCommandFunc)p;
 		}
 
-		__try {
-			int result = g_sendCommand(parameter);
-			return result;
+		const char* altNames[] = {
+			"sendCommand", "send_command", "SendCmd", "_SendCommand"
+		};
+
+		for (const char* name : altNames) {
+			p = GetExportedFunction(hMod, name);
+			if (p) {
+				te::sdk::helper::logging::Log("[SendCommand] Found export '%s' at %p", name, p);
+				return (SendCommandFunc)p;
+			}
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			sdk::helper::logging::Log("[SendCommand] Exception occurred during SendCommand call");
-			return -1;
-		}
+
+		te::sdk::helper::logging::Log("[SendCommand] Export not found");
+		return nullptr;
 	}
 
-	int __stdcall HookedChatPush(int a1)
+	// ---------- Hook Functions ----------
+	int __cdecl Hooked_SendCommand(const char* str)
 	{
-		if (a1 != 0) {
+		if (str) {
+			__try {
+				te::sdk::helper::logging::Log("[SendCommand] param=\"%s\"", str);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				te::sdk::helper::logging::Log("[SendCommand] param=<invalid pointer>");
+			}
+		}
+		else {
+			te::sdk::helper::logging::Log("[SendCommand] param=NULL");
+		}
+
+		return g_SendCommand ? g_SendCommand(str) : -1;
+	}
+
+	int __stdcall Hooked_ChatPush(int a1)
+	{
+		if (a1) {
 			char buffer[1024] = { 0 };
 			size_t actualLength = 0;
 
@@ -367,548 +336,89 @@ namespace te::rce::fz::bypass
 				command = SpoofCommandHWData(command);
 				te::sdk::helper::logging::Log("[FenixZone AC Bypass] Processed command: %s", command.c_str());
 
-				SafeCallSendCommand(reinterpret_cast<int>(command.c_str()));
-				return 1;
-			}
-		}
-
-		return SafeCallOriginalFunction(g_chatPushHook.trampoline, a1);
-	}
-
-	bool InstallChatPushHook(uintptr_t moduleBase)
-	{
-		g_chatPushHook.originalFunction = helper::PatternScan(moduleBase, SIG_FENIXZONE_CHAT_PUSH, false);
-		if (!g_chatPushHook.originalFunction) {
-			sdk::helper::logging::Log("[ChatPush Hook] Failed to find function with signature");
-			return false;
-		}
-
-		BYTE* funcBytes = reinterpret_cast<BYTE*>(g_chatPushHook.originalFunction);
-
-		if (funcBytes[0] != 0x55) {
-			sdk::helper::logging::Log("[ChatPush Hook] Function signature verification failed - missing push ebp");
-			return false;
-		}
-
-		const size_t prologueSize = 24;
-		const size_t hookSize = 29;
-
-		memcpy(g_chatPushHook.originalBytes, funcBytes, hookSize);
-
-		int32_t originalJmpOffset = *reinterpret_cast<int32_t*>(&funcBytes[25]); // offset po E9
-		uintptr_t originalJmpTarget = g_chatPushHook.originalFunction + 29 + originalJmpOffset;
-
-		g_chatPushHook.trampoline = static_cast<BYTE*>(VirtualAlloc(
-			nullptr,
-			64,
-			MEM_COMMIT | MEM_RESERVE,
-			PAGE_EXECUTE_READWRITE
-		));
-
-		if (!g_chatPushHook.trampoline) {
-			sdk::helper::logging::Log("[ChatPush Hook] Failed to allocate trampoline");
-			return false;
-		}
-
-		memcpy(g_chatPushHook.trampoline, g_chatPushHook.originalBytes, prologueSize);
-
-		BYTE* jumpToTarget = g_chatPushHook.trampoline + prologueSize;
-		jumpToTarget[0] = 0xE9; // JMP instruction
-		*reinterpret_cast<DWORD*>(jumpToTarget + 1) =
-			originalJmpTarget - (reinterpret_cast<uintptr_t>(jumpToTarget) + 5);
-
-		// Install the hook
-		DWORD oldProtect;
-		if (!VirtualProtect(funcBytes, hookSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-			sdk::helper::logging::Log("[ChatPush Hook] Failed to change memory protection");
-			VirtualFree(g_chatPushHook.trampoline, 0, MEM_RELEASE);
-			return false;
-		}
-
-		// Create the hook jump - we need exactly 5 bytes for the JMP
-		funcBytes[0] = 0xE9; // JMP instruction
-		*reinterpret_cast<DWORD*>(funcBytes + 1) =
-			reinterpret_cast<uintptr_t>(HookedChatPush) - (g_chatPushHook.originalFunction + 5);
-
-		for (size_t i = 5; i < hookSize; ++i) {
-			funcBytes[i] = 0x90; // NOP
-		}
-
-		// Restore original protection
-		VirtualProtect(funcBytes, hookSize, oldProtect, &oldProtect);
-
-		g_chatPushHook.isHooked = true;
-		sdk::helper::logging::Log("[ChatPush Hook] Successfully installed hook");
-
-		return true;
-	}
-
-	static PatternData& ParsePattern(const char* sig)
-	{
-		auto it = s_patternCache.find(sig);
-		if (it != s_patternCache.end()) return it->second;
-
-		PatternData pd;
-		const char* cur = sig;
-		while (*cur)
-		{
-			if (*cur == '?')
-			{
-				++cur;
-				if (*cur == '?') ++cur;
-				pd.bytes.push_back(0);
-				pd.mask.push_back(false);
-			}
-			else
-			{
-				pd.bytes.push_back(static_cast<uint8_t>(strtoul(cur, const_cast<char**>(&cur), 16)));
-				pd.mask.push_back(true);
-			}
-			if (*cur == ' ') ++cur;
-		}
-		pd.firstWildcard = !pd.mask[0];
-		pd.firstByte = pd.bytes[0];
-		return s_patternCache.emplace(sig, std::move(pd)).first->second;
-	}
-
-	uintptr_t PatternScanRCEOnly(const char* signature, bool skipFirst = false)
-	{
-		auto& pat = ParsePattern(signature);
-		size_t pLen = pat.bytes.size();
-		if (pLen == 0) return 0;
-
-		MEMORY_BASIC_INFORMATION mbi;
-		uintptr_t address = 0;
-		bool foundOnce = false;
-
-		while (VirtualQuery((void*)address, &mbi, sizeof(mbi)) == sizeof(mbi))
-		{
-			if (mbi.State == MEM_COMMIT
-				&& mbi.Type == MEM_PRIVATE
-				&& (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
-				&& !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
-			{
-				auto* region = reinterpret_cast<const uint8_t*>(mbi.BaseAddress);
-				size_t regionSize = mbi.RegionSize;
-				if (regionSize >= pLen)
-				{
-					const uint8_t* cur = region;
-					const uint8_t* end = region + regionSize - pLen;
-
-					while (cur <= end)
-					{
-						if (!pat.firstWildcard)
-						{
-							cur = static_cast<const uint8_t*>(memchr(cur, pat.firstByte, (end - cur) + 1));
-							if (!cur) break;
-						}
-						bool ok = true;
-						for (size_t j = 0; j < pLen; ++j)
-						{
-							if (pat.mask[j] && cur[j] != pat.bytes[j])
-							{
-								ok = false;
-								break;
-							}
-						}
-						if (ok)
-						{
-							if (skipFirst && !foundOnce)
-							{
-								foundOnce = true;
-							}
-							else
-							{
-								return uintptr_t(cur);
-							}
-						}
-						++cur;
-					}
+				if (g_SendCommand) {
+					return g_SendCommand(command.c_str());
 				}
 			}
-			address += mbi.RegionSize;
 		}
-		return 0;
+
+		return g_ChatPush_Orig ? g_ChatPush_Orig(a1) : 0;
 	}
 
-	bool TryCreateHook(const char* name, uintptr_t sig, LPVOID hookFunc, LPVOID* original)
+	static void __cdecl ServerComm_Impl(int a1_ebp, const void* a2_esi)
 	{
-		if (sig == 0)
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Signature for %s not found.", name);
-			return false;
-		}
-
-		LONG error = NO_ERROR;
-
-		// Set the original function pointer (Detours expects the original, NOT the address!)
-		*original = reinterpret_cast<LPVOID>(sig);
-
-		error = DetourTransactionBegin();
-		if (error != NO_ERROR)
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionBegin failed for %s: %ld", name,
-			                             error);
-			return false;
-		}
-
-		error = DetourUpdateThread(GetCurrentThread());
-		if (error != NO_ERROR)
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourUpdateThread failed for %s: %ld", name, error);
-			DetourTransactionAbort();
-			return false;
-		}
-
-		// Attach
-		error = DetourAttach(original, hookFunc);
-		if (error != NO_ERROR)
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourAttach failed for %s: %ld", name, error);
-			DetourTransactionAbort();
-			return false;
-		}
-
-		error = DetourTransactionCommit();
-		if (error != NO_ERROR)
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] DetourTransactionCommit failed for %s: %ld", name,
-			                             error);
-			return false;
-		}
-
-		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Hooked %s at 0x%p", name, (void*)sig);
-		return true;
-	}
-
-	bool FindMethodAndHook()
-	{
-		te::sdk::helper::logging::Log("[FenixZone AC Bypass] Scanning for signatures...");
-
-		//uintptr_t sigTerminateGTA = helper::PatternScan(g_mappedBase, SIG_FENIXZONE_CLOSE, false);
-		//uintptr_t sigTimerFunc = helper::PatternScan(g_mappedBase, SIG_FENIXZONE_TIMER_FUNC, false);
-
-		bool success = true;
-
-		//success &= TryCreateHook("TerminateGTA", sigTerminateGTA, &hkTerminateGTA, reinterpret_cast<LPVOID*>(&oTerminateGTA));
-		success &= InstallChatPushHook(g_mappedBase);
-		//success &= TryCreateHook("TimerFunc", sigTimerFunc, &hkTimerFunc, reinterpret_cast<LPVOID*>(&oTimerFunc));
-
-		if (success)
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] All hooks attached successfully.");
-		else
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] One or more hooks failed.");
-
-		return success;
-	}
-
-	ManualMapResult ManualMapDllFromMemory(const std::vector<uint8_t>& dllBytes)
-	{
-		ManualMapResult result;
-
-		if (dllBytes.size() < sizeof(IMAGE_DOS_HEADER)) {
-			te::sdk::helper::logging::Log("[ManualMap] Input buffer too small for IMAGE_DOS_HEADER");
-			return result;
-		}
-
-		if (dllBytes[0] == 'A' && dllBytes[1] == 'X') {
-			te::sdk::helper::logging::Log("[ManualMap] Obfuscated AX header detected, converting to MZ");
-			const_cast<uint8_t&>(dllBytes[0]) = 'M';
-			const_cast<uint8_t&>(dllBytes[1]) = 'Z';
-		}
-
-		auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllBytes.data());
-		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-			te::sdk::helper::logging::Log("[ManualMap] Invalid DOS signature (expected MZ)");
-			return result;
-		}
-
-		auto* ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(dllBytes.data() + dosHeader->e_lfanew);
-		if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
-			te::sdk::helper::logging::Log("[ManualMap] Invalid NT signature (expected PE)");
-			return result;
-		}
-
-		const auto& optional = ntHeader->OptionalHeader;
-		SIZE_T sizeOfImage = optional.SizeOfImage;
-		SIZE_T sizeOfHeaders = optional.SizeOfHeaders;
-
-		te::sdk::helper::logging::Log("[ManualMap] Mapping image of size 0x%X (headers: 0x%X)", (unsigned)sizeOfImage, (unsigned)sizeOfHeaders);
-
-		LPVOID baseAddress = VirtualAlloc(reinterpret_cast<LPVOID>(optional.ImageBase),
-			sizeOfImage,
-			MEM_COMMIT | MEM_RESERVE,
-			PAGE_EXECUTE_READWRITE);
-
-		if (!baseAddress) {
-			te::sdk::helper::logging::Log("[ManualMap] Failed to allocate at preferred base 0x%p, trying anywhere", (void*)optional.ImageBase);
-			baseAddress = VirtualAlloc(nullptr, sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-			if (!baseAddress) {
-				te::sdk::helper::logging::Log("[ManualMap] VirtualAlloc failed");
-				return result;
+		if (a2_esi) {
+			char preview[64] = {};
+			__try {
+				memcpy(preview, a2_esi, sizeof(preview) - 1);
 			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			te::sdk::helper::logging::Log("[ServerComm] a1=0x%08X a2=\"%s\"", a1_ebp, preview);
 		}
-
-		te::sdk::helper::logging::Log("[ManualMap] Allocated image at 0x%p", baseAddress);
-		result.imageBase = baseAddress;
-
-		std::memcpy(baseAddress, dllBytes.data(), sizeOfHeaders);
-
-		auto* section = IMAGE_FIRST_SECTION(ntHeader);
-		for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i, ++section)
-		{
-			void* dest = reinterpret_cast<uint8_t*>(baseAddress) + section->VirtualAddress;
-			const void* src = dllBytes.data() + section->PointerToRawData;
-			std::memcpy(dest, src, section->SizeOfRawData);
-			te::sdk::helper::logging::Log("[ManualMap] Copied section %.*s to 0x%p (size: 0x%X)",
-				8, section->Name, dest, section->SizeOfRawData);
-		}
-
-		// Resolve imports
-		if (optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
-		{
-			auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
-				reinterpret_cast<uint8_t*>(baseAddress) +
-				optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-
-			while (importDesc->Name)
-			{
-				const char* dllName = reinterpret_cast<const char*>(
-					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->Name);
-
-				HMODULE hDll = LoadLibraryA(dllName);
-				if (!hDll) {
-					te::sdk::helper::logging::Log("[ManualMap] Failed to LoadLibraryA: %s", dllName);
-					return result;
-				}
-
-				te::sdk::helper::logging::Log("[ManualMap] Loaded import: %s", dllName);
-
-				auto* thunkRef = reinterpret_cast<IMAGE_THUNK_DATA*>(
-					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->FirstThunk);
-				auto* origThunkRef = reinterpret_cast<IMAGE_THUNK_DATA*>(
-					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->OriginalFirstThunk);
-
-				while (thunkRef->u1.AddressOfData)
-				{
-					FARPROC func = nullptr;
-					if (origThunkRef->u1.Ordinal & IMAGE_ORDINAL_FLAG)
-					{
-						func = GetProcAddress(hDll, reinterpret_cast<LPCSTR>(
-							origThunkRef->u1.Ordinal & 0xFFFF));
-					}
-					else
-					{
-						auto* importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-							reinterpret_cast<uint8_t*>(baseAddress) + origThunkRef->u1.AddressOfData);
-						func = GetProcAddress(hDll, importByName->Name);
-					}
-
-					if (!func) {
-						te::sdk::helper::logging::Log("[ManualMap] Failed to resolve import");
-						return result;
-					}
-
-					thunkRef->u1.Function = reinterpret_cast<ULONG_PTR>(func);
-					++thunkRef;
-					++origThunkRef;
-				}
-
-				++importDesc;
-			}
-		}
-
-		// Relocations
-		if (reinterpret_cast<uintptr_t>(baseAddress) != optional.ImageBase &&
-			optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
-		{
-			uintptr_t delta = reinterpret_cast<uintptr_t>(baseAddress) - optional.ImageBase;
-
-			auto* reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-				reinterpret_cast<uint8_t*>(baseAddress) +
-				optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-
-			while (reloc->VirtualAddress)
-			{
-				DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-				WORD* relocData = reinterpret_cast<WORD*>(reloc + 1);
-
-				for (DWORD i = 0; i < count; ++i)
-				{
-					WORD typeOffset = relocData[i];
-					WORD type = typeOffset >> 12;
-					WORD offset = typeOffset & 0xFFF;
-
-					if (type == IMAGE_REL_BASED_HIGHLOW || type == IMAGE_REL_BASED_DIR64)
-					{
-						uintptr_t* patchAddr = reinterpret_cast<uintptr_t*>(
-							reinterpret_cast<uint8_t*>(baseAddress) + reloc->VirtualAddress + offset);
-						*patchAddr += delta;
-					}
-				}
-
-				reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
-					reinterpret_cast<uint8_t*>(reloc) + reloc->SizeOfBlock);
-			}
-
-			te::sdk::helper::logging::Log("[ManualMap] Relocations applied (delta: 0x%p)", (void*)delta);
-		}
-
-		// Return entry point
-		result.entryPoint = reinterpret_cast<void*>(
-			reinterpret_cast<uint8_t*>(baseAddress) + optional.AddressOfEntryPoint);
-
-		te::sdk::helper::logging::Log("[ManualMap] Mapping complete. Entry point at 0x%p", result.entryPoint);
-		return result;
 	}
 
-	void LogSessionInfo()
+	__declspec(naked) void Hooked_ServerComm()
 	{
-		te::sdk::helper::logging::Log("[SessionInfo] === Session Information Dump ===");
-		te::sdk::helper::logging::Log("[SessionInfo] Server IP: %s", te::sdk::GetSessionInfo().serverIP);
-		te::sdk::helper::logging::Log("[SessionInfo] Server Port: %u", te::sdk::GetSessionInfo().serverPort);
-		te::sdk::helper::logging::Log("[SessionInfo] Client Port: %u", te::sdk::GetSessionInfo().clientPort);
-		te::sdk::helper::logging::Log("[SessionInfo] Is Connected: %s", te::sdk::GetSessionInfo().isConnected ? "true" : "false");
-		te::sdk::helper::logging::Log("[SessionInfo] Depreciated: %u", te::sdk::GetSessionInfo().depreciated);
-		te::sdk::helper::logging::Log("[SessionInfo] Thread Sleep Timer: %d ms", te::sdk::GetSessionInfo().threadSleepTimer);
-		te::sdk::helper::logging::Log("[SessionInfo] === End Session Information ===");
+		__asm {
+			pushfd
+			pushad
+			mov eax, ebp
+			mov edx, esi
+			push edx
+			push eax
+			call ServerComm_Impl
+			add esp, 8
+			popad
+			popfd
+			jmp g_ServerComm_Orig
+		}
 	}
 
-	std::vector<uint8_t> LoadAnticheatFZ()
+	BOOL WINAPI Hooked_WriteFile(HANDLE h, LPCVOID buf, DWORD n, LPDWORD out, LPOVERLAPPED ov)
 	{
-		char path[MAX_PATH];
-		DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
-		if (len == 0 || len == MAX_PATH) {
-			std::cerr << "Failed to get module path\n";
-			return {};
-		}
-
-		std::string basePath(path);
-		size_t lastSlash = basePath.find_last_of("\\/");
-		if (lastSlash != std::string::npos) {
-			basePath = basePath.substr(0, lastSlash + 1);
-		}
-
-		std::string filePath = basePath + "rce_protection\\fz_bypass\\anticheat.fz";
-
-		std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-		if (!file.is_open()) {
-			std::cerr << "Failed to open: " << filePath << "\n";
-			return {};
-		}
-
-		std::streamsize size = file.tellg();
-		file.seekg(0, std::ios::beg);
-
-		std::vector<uint8_t> buffer(size);
-		if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-			std::cerr << "Failed to read file: " << filePath << "\n";
-			return {};
-		}
-
-		return buffer;
-	}
-
-	std::vector<uint8_t> LoadAnticheatCommFZ()
-	{
-		char path[MAX_PATH];
-		DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
-		if (len == 0 || len == MAX_PATH) {
-			std::cerr << "Failed to get module path\n";
-			return {};
-		}
-
-		std::string basePath(path);
-		size_t lastSlash = basePath.find_last_of("\\/");
-		if (lastSlash != std::string::npos) {
-			basePath = basePath.substr(0, lastSlash + 1);
-		}
-
-		std::string filePath = basePath + "rce_protection\\fz_bypass\\comm.fz";
-
-		std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-		if (!file.is_open()) {
-			std::cerr << "Failed to open: " << filePath << "\n";
-			return {};
-		}
-
-		std::streamsize size = file.tellg();
-		file.seekg(0, std::ios::beg);
-
-		std::vector<uint8_t> buffer(size);
-		if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-			std::cerr << "Failed to read file: " << filePath << "\n";
-			return {};
-		}
-
-		return buffer;
-	}
-
-	size_t GetFunctionSizeByRetn(uintptr_t funcAddr, size_t maxScanSize = 0x2000)
-	{
-		auto code = reinterpret_cast<uint8_t*>(funcAddr);
-
-		for (size_t i = 0; i + 3 < maxScanSize; ++i)
-		{
-			// Look for different return patterns
-			if ((code[i] == 0xC2 && i + 2 < maxScanSize) ||  // RET imm16
-				(code[i] == 0xC3) ||                          // RET
-				(code[i] == 0xCA && i + 2 < maxScanSize) ||   // RETF imm16  
-				(code[i] == 0xCB))                            // RETF
-			{
-				// For RET imm16, add 3 bytes (opcode + 2 byte operand)
-				if (code[i] == 0xC2 || code[i] == 0xCA)
-					return i + 3;
-				else
-					return i + 1;
-			}
-		}
-
-		return maxScanSize; // Return max size if no return found
-	}
-
-	BOOL SafeReadMemory(void* address, void* buffer, size_t size)
-	{
-		__try {
-			memcpy(buffer, address, size);
-			return TRUE;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
+		char name[MAX_PATH] = {};
+		GetFinalPathNameByHandleA(h, name, MAX_PATH, FILE_NAME_NORMALIZED);
+		if (strstr(name, "Hyisdnga.tmp")) {
+			SetLastError(ERROR_ACCESS_DENIED);
 			return FALSE;
 		}
+		return g_WriteFile_Orig(h, buf, n, out, ov);
 	}
 
-	BOOL SafeCallFunction(uintptr_t funcAddr, uint32_t* result)
+	VOID WINAPI Hooked_ExitProcess(UINT code)
 	{
-		__try {
-			uint8_t* targetCode = reinterpret_cast<uint8_t*>(funcAddr);
-			*result = *reinterpret_cast<uint32_t*>(targetCode);
-			return TRUE;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			return FALSE;
-		}
+		te::sdk::helper::logging::Log("[ExitProcess] blocked code=0x%X (press END to allow)", code);
+		while (!(GetAsyncKeyState(VK_END) & 0x8000)) Sleep(50);
+		g_ExitProcess_Orig(code);
 	}
 
+	BOOL WINAPI Hooked_TerminateProcess(HANDLE hProc, UINT code)
+	{
+		if (GetProcessId(hProc) == GetCurrentProcessId()) {
+			te::sdk::helper::logging::Log("[TerminateProcess] blocked code=0x%X (press END to allow)", code);
+			while (!(GetAsyncKeyState(VK_END) & 0x8000)) Sleep(50);
+		}
+		return g_TerminateProcess_Orig(hProc, code);
+	}
+
+	// ---------- CreateThread Patching ----------
 	bool Patch_AllCreateThreadInFunction(uintptr_t funcAddr)
 	{
-		// Validate memory
 		MEMORY_BASIC_INFORMATION mbi;
 		if (!VirtualQuery(reinterpret_cast<void*>(funcAddr), &mbi, sizeof(mbi))) {
-			sdk::helper::logging::Log("[Bypass] Failed to query memory at 0x%p", (void*)funcAddr);
+			te::sdk::helper::logging::Log("[Bypass] Failed to query memory at 0x%p", (void*)funcAddr);
 			return true;
 		}
 
 		if (mbi.State != MEM_COMMIT ||
 			!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
-			sdk::helper::logging::Log("[Bypass] Memory at 0x%p is not executable", (void*)funcAddr);
+			te::sdk::helper::logging::Log("[Bypass] Memory at 0x%p is not executable", (void*)funcAddr);
 			return true;
 		}
 
-		// FIXED: Increased scan size and simplified logic
 		uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
 		uintptr_t regionEnd = regionStart + mbi.RegionSize;
-		uintptr_t maxScanEnd = funcAddr + 0x1000; // Increased to 4KB
+		uintptr_t maxScanEnd = funcAddr + 0x1000;
 
 		if (maxScanEnd > regionEnd) {
 			maxScanEnd = regionEnd;
@@ -916,29 +426,20 @@ namespace te::rce::fz::bypass
 
 		size_t funcSize = maxScanEnd - funcAddr;
 		if (funcSize < 16) {
-			sdk::helper::logging::Log("[Bypass] Function size too small: 0x%X bytes", (unsigned)funcSize);
+			te::sdk::helper::logging::Log("[Bypass] Function size too small: 0x%X bytes", (unsigned)funcSize);
 			return true;
 		}
-
-		sdk::helper::logging::Log("[Bypass] Scanning 0x%X bytes at 0x%p", (unsigned)funcSize, (void*)funcAddr);
 
 		auto code = reinterpret_cast<uint8_t*>(funcAddr);
 		int patched = 0;
 
 		HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-		if (!hKernel32) {
-			sdk::helper::logging::Log("[Bypass] Failed to get kernel32.dll handle");
-			return true;
-		}
+		if (!hKernel32) return true;
 
 		FARPROC pCreateThread = GetProcAddress(hKernel32, "CreateThread");
-		if (!pCreateThread) {
-			sdk::helper::logging::Log("[Bypass] Failed to get CreateThread address");
-			return true;
-		}
+		if (!pCreateThread) return true;
 
 		__try {
-			// FIXED: Simplified linear scanning without chunking
 			for (size_t i = 0; i + 5 <= funcSize; ++i)
 			{
 				if (code[i] == 0xE8) // CALL instruction
@@ -946,12 +447,8 @@ namespace te::rce::fz::bypass
 					int32_t rel = *reinterpret_cast<int32_t*>(&code[i + 1]);
 					uintptr_t callTarget = funcAddr + i + 5 + rel;
 
-					// Bounds check
-					if (callTarget < 0x10000 || callTarget > 0x7FFFFFFF) {
-						continue;
-					}
+					if (callTarget < 0x10000 || callTarget > 0x7FFFFFFF) continue;
 
-					// Check direct call to CreateThread
 					if (callTarget == reinterpret_cast<uintptr_t>(pCreateThread))
 					{
 						DWORD oldProtect;
@@ -964,11 +461,10 @@ namespace te::rce::fz::bypass
 						continue;
 					}
 
-					// Check import thunk call
 					uint8_t thunkBytes[6];
 					if (SafeReadMemory(reinterpret_cast<void*>(callTarget), thunkBytes, 6))
 					{
-						if (thunkBytes[0] == 0xFF && thunkBytes[1] == 0x25) // JMP [address]
+						if (thunkBytes[0] == 0xFF && thunkBytes[1] == 0x25)
 						{
 							uint32_t importAddr = *reinterpret_cast<uint32_t*>(&thunkBytes[2]);
 							uint32_t finalTarget;
@@ -980,7 +476,7 @@ namespace te::rce::fz::bypass
 									DWORD oldProtect;
 									if (VirtualProtect(&code[i], 5, PAGE_EXECUTE_READWRITE, &oldProtect))
 									{
-										memset(&code[i], 0x90, 5); // NOP
+										memset(&code[i], 0x90, 5);
 										VirtualProtect(&code[i], 5, oldProtect, &oldProtect);
 										++patched;
 									}
@@ -989,7 +485,6 @@ namespace te::rce::fz::bypass
 						}
 					}
 				}
-				// Check indirect calls: FF 15 [address]
 				else if (i + 6 <= funcSize && code[i] == 0xFF && code[i + 1] == 0x15)
 				{
 					uint32_t ptrAddr = *reinterpret_cast<uint32_t*>(&code[i + 2]);
@@ -1004,10 +499,10 @@ namespace te::rce::fz::bypass
 								DWORD oldProtect;
 								if (VirtualProtect(&code[i], 6, PAGE_EXECUTE_READWRITE, &oldProtect))
 								{
-									memset(&code[i], 0x90, 6); // NOP
+									memset(&code[i], 0x90, 6);
 									VirtualProtect(&code[i], 6, oldProtect, &oldProtect);
 									++patched;
-									i += 5; // Skip the rest of this instruction
+									i += 5;
 								}
 							}
 						}
@@ -1016,48 +511,99 @@ namespace te::rce::fz::bypass
 			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
-			sdk::helper::logging::Log("[Bypass] Exception during scanning at 0x%p", (void*)funcAddr);
+			te::sdk::helper::logging::Log("[Bypass] Exception during scanning at 0x%p", (void*)funcAddr);
 		}
 
-		sdk::helper::logging::Log("[Bypass] Patched %d CreateThread calls", patched);
+		te::sdk::helper::logging::Log("[Bypass] Patched %d CreateThread calls", patched);
 		return true;
 	}
 
-	BOOL SafeCallDllMain(void* entryPoint, void* base)
+	// ---------- Hook Installation ----------
+	static bool InstallAllHooks(HMODULE mappedCommDll, HMODULE mappedMainDll)
 	{
-		typedef BOOL(WINAPI* DllMainFunc)(HINSTANCE, DWORD, LPVOID);
-		DllMainFunc DllMain = reinterpret_cast<DllMainFunc>(entryPoint);
+		LONG err = DetourTransactionBegin();
+		if (err != NO_ERROR) return false;
+		DetourUpdateThread(GetCurrentThread());
 
-		BOOL result = FALSE;
-
-		__try {
-			result = DllMain(reinterpret_cast<HINSTANCE>(base), DLL_PROCESS_ATTACH, nullptr);
+		// SendCommand from comm DLL
+		if (mappedCommDll) {
+			g_SendCommand = ResolveSendCommand(mappedCommDll);
+			if (g_SendCommand) {
+				DetourAttach(&(PVOID&)g_SendCommand, Hooked_SendCommand);
+				te::sdk::helper::logging::Log("[detours] SendCommand hooked @%p", g_SendCommand);
+			}
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			sdk::helper::logging::Log("[DllMain] Exception occurred during DllMain execution");
-			result = FALSE;
+
+		// ChatPush from main DLL
+		if (mappedMainDll) {
+			auto chatPushAddr = (ChatPushFunc)PatternScanModule(mappedMainDll, SIG_FENIXZONE_CHAT_PUSH);
+			if (chatPushAddr) {
+				g_ChatPush_Orig = chatPushAddr;
+				DetourAttach(&(PVOID&)g_ChatPush_Orig, Hooked_ChatPush);
+				te::sdk::helper::logging::Log("[detours] ChatPush hooked @%p", chatPushAddr);
+			}
+
+			auto serverCommAddr = (ServerCommFunc)PatternScanModule(mappedMainDll, SIG_SERVER_COMMUNICATION);
+			if (serverCommAddr) {
+				g_ServerComm_Orig = serverCommAddr;
+				DetourAttach(&(PVOID&)g_ServerComm_Orig, Hooked_ServerComm);
+				te::sdk::helper::logging::Log("[detours] ServerComm hooked @%p", serverCommAddr);
+			}
 		}
 
-		return result;
+		// System APIs
+		HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+		if (hK32) {
+			g_WriteFile_Orig = (WriteFileFunc)GetProcAddress(hK32, "WriteFile");
+			//g_ExitProcess_Orig = (ExitProcessFunc)GetProcAddress(hK32, "ExitProcess");
+			//g_TerminateProcess_Orig = (TerminateProcessFunc)GetProcAddress(hK32, "TerminateProcess");
+
+			if (g_WriteFile_Orig) DetourAttach(&(PVOID&)g_WriteFile_Orig, Hooked_WriteFile);
+			if (g_ExitProcess_Orig) DetourAttach(&(PVOID&)g_ExitProcess_Orig, Hooked_ExitProcess);
+			if (g_TerminateProcess_Orig) DetourAttach(&(PVOID&)g_TerminateProcess_Orig, Hooked_TerminateProcess);
+		}
+
+		err = DetourTransactionCommit();
+		if (err != NO_ERROR) {
+			te::sdk::helper::logging::Log("[detours] commit failed: %ld", err);
+			return false;
+		}
+		return true;
 	}
 
-	std::string CreateCustomSpoofedButoCommand()
+	static void UninstallAllHooks()
 	{
-		std::string spoofedCommand = "/buto CLA: " +
-			GetRandomDisplayDevice() + " " +           // GPU: Random GPU instead of RTX 3060 Ti
-			RandomRAM() + " " +                        // RAM: Random RAM instead of 16609312 KB
-			std::to_string(4 + rand() % 13) + " " +    // Processors: 4-16 instead of 12
-			std::to_string(4 + rand() % 4) + "-" +     // Keyboard type: 4-7 instead of 4
-			std::to_string(rand() % 12) + "-" +        // Keyboard subtype: 0-11 instead of 0
-			std::to_string(1 + rand() % 12) + "-" +    // Function keys: 1-12 instead of 12
-			std::to_string(43 + rand() % 10) + " " +   // System metrics: 43-52 instead of 6
-			RandomCPU() + " " +                        // CPU: Random CPU instead of i5-11400F
-			GenerateRandomCPUID();                     // CPUID: Random values instead of 0x000A0671 0xBFEBFBFF 0x7FFAFBBF
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
 
-		return spoofedCommand;
+		if (g_SendCommand) DetourDetach(&(PVOID&)g_SendCommand, Hooked_SendCommand);
+		if (g_ChatPush_Orig) DetourDetach(&(PVOID&)g_ChatPush_Orig, Hooked_ChatPush);
+		if (g_ServerComm_Orig) DetourDetach(&(PVOID&)g_ServerComm_Orig, Hooked_ServerComm);
+		if (g_WriteFile_Orig) DetourDetach(&(PVOID&)g_WriteFile_Orig, Hooked_WriteFile);
+		if (g_ExitProcess_Orig) DetourDetach(&(PVOID&)g_ExitProcess_Orig, Hooked_ExitProcess);
+		if (g_TerminateProcess_Orig) DetourDetach(&(PVOID&)g_TerminateProcess_Orig, Hooked_TerminateProcess);
+
+		DetourTransactionCommit();
 	}
 
-	std::string GenerateDRAString()
+	// ---------- Command Emulation ----------
+	static uint8_t GetMessageNumberValue(HMODULE hMod)
+	{
+		static uintptr_t addrMessageNumber = 0;
+
+		if (!addrMessageNumber) {
+			uintptr_t sigAddr = PatternScanModule(hMod, SIG_MESSAGE_NUMBER);
+			if (!sigAddr) {
+				te::sdk::helper::logging::Log("[GetMessageNumber] Signature not found");
+				return 0;
+			}
+			addrMessageNumber = *reinterpret_cast<uintptr_t*>(sigAddr + 2);
+		}
+
+		return *reinterpret_cast<uint8_t*>(addrMessageNumber);
+	}
+
+	static std::string GenerateDRAString()
 	{
 		char expandedPath[MAX_PATH];
 		DWORD result = ExpandEnvironmentStringsA("%PUBLIC%\\Pictures", expandedPath, MAX_PATH);
@@ -1083,8 +629,6 @@ namespace te::rce::fz::bypass
 				// Check if this starts with "dRA" (case-sensitive)
 				if (fileName.length() > 3 && fileName.substr(0, 3) == "dRA") {
 					draString = fileName;
-
-					te::sdk::helper::logging::Log("[DRA Generator] DRA string: %s", draString.c_str());
 					break; // Take the first match
 				}
 			} while (FindNextFileA(hFind, &findData));
@@ -1098,71 +642,345 @@ namespace te::rce::fz::bypass
 		return draString;
 	}
 
-	std::string CreateSpoofedQuotoCommand()
+	void EmulateCommands(HMODULE hMod)
 	{
-		std::string spoofedCommand = "/quto MON: " +
-			GetRandomDisplayDevice() + " " +           // GPU: Random GPU
-			std::to_string(4 + rand() % 13) + " " +    // Processors: 4-16
-			std::to_string(4 + rand() % 4) + "-" +     // Keyboard type: 4-7
-			std::to_string(rand() % 12) + "-" +        // Keyboard subtype: 0-11
-			std::to_string(1 + rand() % 12) + "-" +    // Function keys: 1-12
-			std::to_string(43 + rand() % 10) + " " +   // System metrics: 43-52
-			RandomCPU() + " " +                        // CPU: Random CPU
-			RandomMonitorID() + " " +                  // Monitor ID: AUS278F
-			RandomResolution();                        // Resolution: 598X336
-
-		return spoofedCommand;
-	}
-
-	std::string CreateSpoofedButoCommandWithDRA()
-	{
-		std::string spoofedCommand = "/buto DRA: " + GenerateDRAString();
-		return spoofedCommand;
-	}
-
-	void EmulateCommands()
-	{
-		if (!g_chatPushHook.isHooked) {
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Chat hook not installed, cannot emulate commands");
+		if (!g_SendCommand) {
+			te::sdk::helper::logging::Log("[EMULATOR] g_SendCommand not set");
 			return;
 		}
 
-		// Generate and send custom spoofed /buto command
-		std::string claCommand = CreateCustomSpoofedButoCommand();
-		HookedChatPush(reinterpret_cast<int>(claCommand.c_str()));
+		srand((unsigned)time(nullptr));
+		auto spoof = [](int base, int delta) { return base + (rand() % (2 * delta + 1) - delta); };
 
-		// Generate and send DRA command
-		std::string draCommand = CreateSpoofedButoCommandWithDRA();
-		HookedChatPush(reinterpret_cast<int>(draCommand.c_str()));
+		int vramKB = spoof(16609312, 512);
+		int ramGB = spoof(12, 1);
+		int cores = spoof(12, 1);
+		int threads = spoof(5, 1);
+		unsigned hwid = (unsigned)spoof(0x000A0671, 0x10);
 
-		// Generate and send MON command
-		/*std::string monCommand = CreateSpoofedQuotoCommand();
-		HookedChatPush(reinterpret_cast<int>(monCommand.c_str()));*/
+		uint8_t msgNum = GetMessageNumberValue(hMod);
 
-		// Send /cuco 8 command at the end
-		//std::string cucoCommand = "/cuco 8";
-		//HookedChatPush(reinterpret_cast<int>(cucoCommand.c_str()));
+		char cmd1[512];
+		_snprintf_s(cmd1, _TRUNCATE,
+			"/buto CLA: NVIDIA GeForce RTX 3060 Ti %d KB %d 4-0-%d-%d 11th Gen Intel(R) Core(TM) i5-11400F @ 2.60GHz 0x%08X 0xBFEBFBFF 0x7FFAFBBF",
+			vramKB, ramGB, cores, threads, hwid);
+
+		char cmd2[64];
+		_snprintf_s(cmd2, _TRUNCATE, "/buto DRA: %s", GenerateDRAString().c_str());
+
+		char cmd3[512];
+		_snprintf_s(cmd3, _TRUNCATE,
+			"/quto MON: NVIDIA GeForce RTX 3060 Ti %d 4-0-%d-%d 11th Gen Intel(R) Core(TM) i5-11400F @ 2.60GHz AUS278F 598X336",
+			ramGB, cores, threads);
+
+		char cmd4[32];
+		_snprintf_s(cmd4, _TRUNCATE, "/cuco %u", msgNum);
+
+		struct Cmd { const char* text; DWORD delay; };
+		Cmd cmds[] = {
+			{ cmd1, 1501 },
+			{ cmd2, 2000 },
+			{ cmd3, 1001 },
+			{ cmd4, 1001 },
+		};
+
+		for (auto& c : cmds) {
+			te::sdk::helper::logging::Log("[EMULATOR] Sending: %s", c.text);
+			g_SendCommand(c.text);
+			Sleep(c.delay);
+		}
 	}
 
+	// ---------- Manual Mapping ----------
+	ManualMapResult ManualMapDllFromMemory(const std::vector<uint8_t>& dllBytes)
+	{
+		ManualMapResult result{};
+
+		if (dllBytes.size() < sizeof(IMAGE_DOS_HEADER)) {
+			te::sdk::helper::logging::Log("[ManualMap] Input buffer too small for IMAGE_DOS_HEADER");
+			return result;
+		}
+
+		if (dllBytes[0] == 'A' && dllBytes[1] == 'X') {
+			te::sdk::helper::logging::Log("[ManualMap] Obfuscated AX header detected, converting to MZ");
+			const_cast<uint8_t&>(dllBytes[0]) = 'M';
+			const_cast<uint8_t&>(dllBytes[1]) = 'Z';
+		}
+
+		const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllBytes.data());
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+			te::sdk::helper::logging::Log("[ManualMap] Invalid DOS signature (expected MZ)");
+			return result;
+		}
+
+		const auto* ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+			dllBytes.data() + dosHeader->e_lfanew);
+		if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
+			te::sdk::helper::logging::Log("[ManualMap] Invalid NT signature (expected PE)");
+			return result;
+		}
+
+		const auto& optional = ntHeader->OptionalHeader;
+		const SIZE_T sizeOfImage = optional.SizeOfImage;
+		const SIZE_T sizeOfHeaders = optional.SizeOfHeaders;
+
+		te::sdk::helper::logging::Log("[ManualMap] Mapping image of size 0x%X (headers: 0x%X)",
+			(unsigned)sizeOfImage, (unsigned)sizeOfHeaders);
+
+		LPVOID baseAddress = VirtualAlloc(reinterpret_cast<LPVOID>(optional.ImageBase),
+			sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		if (!baseAddress) {
+			te::sdk::helper::logging::Log("[ManualMap] Failed to allocate at preferred base 0x%p, trying anywhere",
+				(void*)optional.ImageBase);
+			baseAddress = VirtualAlloc(nullptr, sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			if (!baseAddress) {
+				te::sdk::helper::logging::Log("[ManualMap] VirtualAlloc failed");
+				return result;
+			}
+		}
+
+		te::sdk::helper::logging::Log("[ManualMap] Allocated image at 0x%p", baseAddress);
+		result.imageBase = baseAddress;
+		result.imageSize = sizeOfImage;
+
+		// Copy headers
+		std::memcpy(baseAddress, dllBytes.data(), sizeOfHeaders);
+
+		// Copy sections
+		auto* section = IMAGE_FIRST_SECTION(ntHeader);
+		for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i, ++section) {
+			if (!section->SizeOfRawData) continue;
+			void* dest = reinterpret_cast<uint8_t*>(baseAddress) + section->VirtualAddress;
+			const void* src = dllBytes.data() + section->PointerToRawData;
+			std::memcpy(dest, src, section->SizeOfRawData);
+			te::sdk::helper::logging::Log("[ManualMap] Copied section %.*s to 0x%p (size: 0x%X)",
+				8, section->Name, dest, section->SizeOfRawData);
+		}
+
+		// Resolve imports
+		if (optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
+			auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+				reinterpret_cast<uint8_t*>(baseAddress) +
+				optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+			while (importDesc->Name) {
+				const char* dllName = reinterpret_cast<const char*>(
+					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->Name);
+
+				HMODULE hDll = LoadLibraryA(dllName);
+				if (!hDll) {
+					te::sdk::helper::logging::Log("[ManualMap] Failed to LoadLibraryA: %s", dllName);
+					return result;
+				}
+				te::sdk::helper::logging::Log("[ManualMap] Loaded import: %s", dllName);
+
+				auto* thunkRef = reinterpret_cast<IMAGE_THUNK_DATA*>(
+					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->FirstThunk);
+				auto* origThunkRef = reinterpret_cast<IMAGE_THUNK_DATA*>(
+					reinterpret_cast<uint8_t*>(baseAddress) + importDesc->OriginalFirstThunk);
+
+				while (thunkRef->u1.AddressOfData) {
+					FARPROC func = nullptr;
+					if (origThunkRef->u1.Ordinal & IMAGE_ORDINAL_FLAG) {
+						func = GetProcAddress(hDll, reinterpret_cast<LPCSTR>(origThunkRef->u1.Ordinal & 0xFFFF));
+					}
+					else {
+						auto* importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+							reinterpret_cast<uint8_t*>(baseAddress) + origThunkRef->u1.AddressOfData);
+						func = GetProcAddress(hDll, importByName->Name);
+					}
+
+					if (!func) {
+						te::sdk::helper::logging::Log("[ManualMap] Failed to resolve import");
+						return result;
+					}
+
+					thunkRef->u1.Function = reinterpret_cast<ULONG_PTR>(func);
+					++thunkRef;
+					++origThunkRef;
+				}
+
+				++importDesc;
+			}
+		}
+
+		// Apply relocations
+		if (reinterpret_cast<uintptr_t>(baseAddress) != optional.ImageBase &&
+			optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) {
+
+			uintptr_t delta = reinterpret_cast<uintptr_t>(baseAddress) - optional.ImageBase;
+
+			auto* reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+				reinterpret_cast<uint8_t*>(baseAddress) +
+				optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+
+			while (reloc->VirtualAddress) {
+				DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+				WORD* relocData = reinterpret_cast<WORD*>(reloc + 1);
+
+				for (DWORD i = 0; i < count; ++i) {
+					WORD typeOffset = relocData[i];
+					WORD type = typeOffset >> 12;
+					WORD offset = typeOffset & 0x0FFF;
+
+					if (type == IMAGE_REL_BASED_HIGHLOW) {
+						auto* patchAddr = reinterpret_cast<DWORD*>(
+							reinterpret_cast<uint8_t*>(baseAddress) + reloc->VirtualAddress + offset);
+						*patchAddr += static_cast<DWORD>(delta);
+					}
+				}
+
+				reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+					reinterpret_cast<uint8_t*>(reloc) + reloc->SizeOfBlock);
+			}
+
+			te::sdk::helper::logging::Log("[ManualMap] Relocations applied (delta: 0x%p)", (void*)delta);
+		}
+
+		// Set entry point
+		result.entryPoint = (optional.AddressOfEntryPoint != 0)
+			? reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(baseAddress) + optional.AddressOfEntryPoint)
+			: nullptr;
+
+		te::sdk::helper::logging::Log("[ManualMap] Mapping complete. Entry point at 0x%p", result.entryPoint);
+		return result;
+	}
+
+	// ---------- File Path Resolution ----------
+	struct FzPaths {
+		std::string acBin;
+		std::string commFz;
+	};
+
+	static FzPaths ResolveFzPaths()
+	{
+		FzPaths p;
+
+		char path[MAX_PATH];
+		DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+		if (len == 0 || len == MAX_PATH) {
+			te::sdk::helper::logging::Log("[paths] Failed to get module path, using defaults");
+			p.acBin = "rce_protection\\fz_bypass\\anticheat.fz";
+			p.commFz = "rce_protection\\fz_bypass\\comm.fz";
+			return p;
+		}
+
+		std::string basePath(path);
+		size_t lastSlash = basePath.find_last_of("\\/");
+		if (lastSlash != std::string::npos) {
+			basePath = basePath.substr(0, lastSlash + 1);
+		}
+
+		p.acBin = basePath + "rce_protection\\fz_bypass\\anticheat.fz";
+		p.commFz = basePath + "rce_protection\\fz_bypass\\comm.fz";
+
+		te::sdk::helper::logging::Log("[paths] acBin = %s", p.acBin.c_str());
+		te::sdk::helper::logging::Log("[paths] commFz = %s", p.commFz.c_str());
+		return p;
+	}
+
+	// ---------- Worker Thread ----------
+	DWORD WINAPI Worker(LPVOID)
+	{
+		te::sdk::helper::logging::Log("[worker] Starting FenixZone bypass initialization");
+
+		auto paths = ResolveFzPaths();
+		std::vector<uint8_t> bytesComm;
+		std::vector<uint8_t> bytesAC;
+
+		if (!ReadFileToVector(paths.commFz, bytesComm, "comm")) {
+			te::sdk::helper::logging::Log("[worker] Cannot read comm.fz -> abort");
+			te::sdk::helper::samp::AddChatMessage("[#TE] Failed to load FenixZone communication module", D3DCOLOR_XRGB(255, 0, 0));
+			return 1;
+		}
+
+		if (!ReadFileToVector(paths.acBin, bytesAC, "ac")) {
+			te::sdk::helper::logging::Log("[worker] WARN: ac bin not loaded, will install only comm/WinAPI hooks");
+			bytesAC.clear();
+		}
+
+		ManualMapResult mmComm = ManualMapDllFromMemory(bytesComm);
+		if (!mmComm.imageBase || !mmComm.entryPoint) {
+			te::sdk::helper::logging::Log("[worker] Manual map COMM failed");
+			te::sdk::helper::samp::AddChatMessage("[#TE] Failed to map communication module", D3DCOLOR_XRGB(255, 0, 0));
+			return 1;
+		}
+		te::sdk::helper::logging::Log("[worker] COMM mapped @ %p, size=%zu, ep=%p", mmComm.imageBase, mmComm.imageSize, mmComm.entryPoint);
+
+		ManualMapResult mmAC{};
+		if (!bytesAC.empty()) {
+			mmAC = ManualMapDllFromMemory(bytesAC);
+			if (!mmAC.imageBase || !mmAC.entryPoint) {
+				te::sdk::helper::logging::Log("[worker] WARN: AC map failed, continuing with COMM only");
+				mmAC = {};
+			}
+			else {
+				te::sdk::helper::logging::Log("[worker] AC mapped @ %p, size=%zu, ep=%p", mmAC.imageBase, mmAC.imageSize, mmAC.entryPoint);
+			}
+		}
+
+		HMODULE hComm = (HMODULE)mmComm.imageBase;
+		HMODULE hAC = (HMODULE)mmAC.imageBase;
+
+		// Patch CreateThread calls before installing hooks
+		if (mmComm.entryPoint) {
+			if (!Patch_AllCreateThreadInFunction(reinterpret_cast<uintptr_t>(mmComm.entryPoint))) {
+				te::sdk::helper::logging::Log("[worker] Failed to patch CreateThread in COMM module");
+				return 1;
+			}
+		}
+
+		// Patch CreateThread calls before installing hooks
+		if (mmAC.entryPoint) {
+			if (!Patch_AllCreateThreadInFunction(reinterpret_cast<uintptr_t>(mmAC.entryPoint))) {
+				te::sdk::helper::logging::Log("[worker] Failed to patch CreateThread in AC module");
+				return 1;
+			}
+		}
+
+		if (!InstallAllHooks(hComm, hAC)) {
+			te::sdk::helper::logging::Log("[worker] InstallAllHooks failed");
+			te::sdk::helper::samp::AddChatMessage("[#TE] Failed to install hooks", D3DCOLOR_XRGB(255, 0, 0));
+			return 1;
+		}
+
+		te::sdk::helper::logging::Log("[worker] Hooks installed successfully");
+
+		// Call DllMain for COMM module
+		if (mmComm.entryPoint && mmComm.imageBase) {
+			if (!SafeCallDllMain(mmComm.entryPoint, mmComm.imageBase)) {
+				te::sdk::helper::logging::Log("[worker] COMM DllMain attach failed");
+				return 1;
+			}
+		}
+
+		// Call DllMain for AC module
+		if (mmAC.entryPoint && mmAC.imageBase) {
+			if (!SafeCallDllMain(mmAC.entryPoint, mmAC.imageBase)) {
+				te::sdk::helper::logging::Log("[worker] AC DllMain attach failed (continuing)");
+			}
+		}
+
+		// Emulate commands
+		EmulateCommands(hAC);
+
+		te::sdk::helper::logging::Log("[worker] FenixZone AC bypass initialized successfully");
+		te::sdk::helper::samp::AddChatMessage("[#TE] FenixZone Anti Cheat bypassed successfully!", D3DCOLOR_XRGB(128, 235, 52));
+		return 0;
+	}
+
+	// ---------- BitStream Processing ----------
 	bool ScanForPEExecutable(BitStream* bs, int rpcId, const std::string& rpcName)
 	{
-		// Make a copy of the BitStream to avoid modifying the original read position
 		int originalOffset = bs->GetReadOffset();
-
-		// Save the original data for later use
 		size_t totalBytes = bs->GetNumberOfBytesUsed();
 		std::vector<unsigned char> allData(totalBytes);
 
-		// Reset read position to start
 		bs->SetReadOffset(0);
-
-		// Read all data into our buffer
 		bs->Read((char*)allData.data(), totalBytes);
-
-		// Restore original read position
 		bs->SetReadOffset(originalOffset);
 
-		// Search for MZ header (0x4D, 0x5A)
+		// Search for MZ header
 		size_t mzOffset = 0;
 		bool foundMZ = false;
 
@@ -1176,154 +994,51 @@ namespace te::rce::fz::bypass
 			}
 		}
 
-		if (!foundMZ)
-		{
+		if (!foundMZ) {
 			te::sdk::helper::logging::Log("[FenixZone AC Bypass] No MZ header found in BitStream data.");
-			return false; // No MZ header found
+			return false;
 		}
 
-		// Verify this is potentially a valid PE file
-		// Check for "PE\0\0" signature which should be at MZ header + offset 0x3C
-		if (mzOffset + 0x40 >= allData.size())
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Not enough data after MZ header to check for PE signature.");
-			return false; // Not enough data for a PE header
+		// Verify PE signature
+		if (mzOffset + 0x40 >= allData.size()) {
+			te::sdk::helper::logging::Log("[FenixZone AC Bypass] Not enough data after MZ header.");
+			return false;
 		}
 
-		// Read the PE header offset from the MZ header
 		uint32_t peOffset = 0;
-		if (mzOffset + 0x3C + sizeof(uint32_t) <= allData.size())
-		{
+		if (mzOffset + 0x3C + sizeof(uint32_t) <= allData.size()) {
 			peOffset = *reinterpret_cast<uint32_t*>(&allData[mzOffset + 0x3C]);
 		}
 
-		// Check if PE signature is present
 		bool isPEFile = false;
-		if (mzOffset + peOffset + 4 <= allData.size())
-		{
+		if (mzOffset + peOffset + 4 <= allData.size()) {
 			isPEFile = (allData[mzOffset + peOffset] == 'P' &&
 				allData[mzOffset + peOffset + 1] == 'E' &&
 				allData[mzOffset + peOffset + 2] == 0 &&
 				allData[mzOffset + peOffset + 3] == 0);
 		}
 
-		// If we have a valid PE file, save it
-		if (isPEFile)
-		{
-			std::vector<unsigned char> exeData(mzOffset + allData.begin(), allData.end());
+		if (isPEFile) {
+			std::vector<unsigned char> exeData(allData.begin() + mzOffset, allData.end());
 
-			try
-			{
-				/*void __userpurge Cero(int a1@<ebp>, HWND a2, UINT a3, UINT_PTR a4, DWORD a5)*/
+			try {
 				auto testSig = helper::PatternScan(reinterpret_cast<uint32_t>(exeData.data()), "A1 ? ? ? ? 83 F8 FF", false);
-				if (testSig != NULL && g_mappedBase == NULL)
-				{
-					te::sdk::helper::logging::Log("Detected FenixZone server, preparing bypass ... (rpcId: %i (%s))", rpcId,
-						rpcName.c_str());
+				if (testSig != NULL) {
+					te::sdk::helper::logging::Log("Detected FenixZone server, preparing bypass... (rpcId: %i (%s))",
+						rpcId, rpcName.c_str());
 
-					auto fzComm = LoadAnticheatCommFZ();
-					if (fzComm.empty())
-					{
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to load FenixZone Anti Cheat communication module.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x0)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					auto mappedPEComm = ManualMapDllFromMemory(fzComm);
-					if (mappedPEComm.imageBase == nullptr || mappedPEComm.entryPoint == nullptr)
-					{
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to map FenixZone Anti Cheat communication module.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x1)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					FARPROC sendCommandAddr = GetExportedFunction(mappedPEComm.imageBase, "SendCommand");
-					if (sendCommandAddr) {
-						g_sendCommand = reinterpret_cast<SendCommandFunc>(sendCommandAddr);
-					}
-
-					if (!Patch_AllCreateThreadInFunction(reinterpret_cast<uintptr_t>(mappedPEComm.entryPoint)))
-					{
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to patch CreateThread in stub function.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x2)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					if (!SafeCallDllMain(mappedPEComm.entryPoint, mappedPEComm.imageBase)) {
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] DllMain call failed or threw an exception.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x3)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					auto fzAnticheat = LoadAnticheatFZ(); 
-					if (fzAnticheat.empty())
-					{
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to load FenixZone Anti Cheat module.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x4)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					auto mappedPE = ManualMapDllFromMemory(fzAnticheat);
-					if (mappedPE.imageBase == nullptr || mappedPE.entryPoint == nullptr)
-					{
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to map FenixZone Anti Cheat module.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x5)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					g_mappedBase = reinterpret_cast<uintptr_t>(mappedPE.imageBase);
-					g_entryRVA = mappedPE.entryPoint ? (reinterpret_cast<uintptr_t>(mappedPE.entryPoint) - reinterpret_cast<uintptr_t>(mappedPE.imageBase)) : 0;
-					g_stubEP = reinterpret_cast<uintptr_t>(mappedPE.entryPoint);
-
-					if (!Patch_AllCreateThreadInFunction(g_stubEP))
-					{
-						te::sdk::helper::logging::Log("[FenixZone AC Bypass] Failed to patch CreateThread in stub function.");
-						te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat. (Error Code: 0x6)", D3DCOLOR_XRGB(255, 0, 0));
-						return false;
-					}
-
-					te::sdk::helper::logging::Log("Stub DllMain called, bypassing FenixZone Anti Cheat...");
-
-					// Now lets fucking bypass this shit
-					{
-						if (FindMethodAndHook())
-						{
-							te::sdk::helper::logging::Log("Methods found and hooked successfully, calling DllMain...");
-
-							if (!SafeCallDllMain(mappedPE.entryPoint, mappedPE.imageBase)) {
-								sdk::helper::logging::Log("DllMain call failed or threw an exception");
-								return false;
-							}
-
-							// Emulate the commands as requested
-							EmulateCommands();
-
-							te::sdk::helper::logging::Log("FenixZone Anti Cheat bypassed successfully!");
-							te::sdk::helper::samp::AddChatMessage("[#TE] FenixZone Anti Cheat bypassed successfully !", D3DCOLOR_XRGB(128, 235, 52));
-						}
-						else
-						{
-							te::sdk::helper::logging::Log("Failed to find and hook methods, aborting bypass.");
-							te::sdk::helper::samp::AddChatMessage("[#TE] Failed to bypass FenixZone Anti Cheat.", D3DCOLOR_XRGB(255, 0, 0));
-							return false;
-						}
-					}
+					// Start bypass in worker thread
+					CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+					return true;
 				}
-				else
-				{
+				else {
 					te::sdk::helper::logging::Log("FenixZone server not detected, skipping.");
-					LogSessionInfo();
 				}
 				return true;
 			}
-			catch (const std::exception& e)
-			{
+			catch (const std::exception& e) {
 				te::sdk::helper::logging::Log("Exception while processing PE executable: %s", e.what());
 			}
-		}
-		else
-		{
-			te::sdk::helper::logging::Log("[FenixZone AC Bypass] No valid PE file found in BitStream data (rpcId: %i, rpcName: %s)", rpcId, rpcName.c_str());
 		}
 
 		return false;
