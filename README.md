@@ -4,8 +4,8 @@ Includes also FZ Bypass feature
 
 ## FZ Bypass
 
-![Status](https://img.shields.io/badge/Status-Detected-red)<br>
-![Last Check](https://img.shields.io/badge/Last_Check-08.08.2025-green)<br>
+![Status](https://img.shields.io/badge/Status-Testing-yellow)<br>
+![Last Check](https://img.shields.io/badge/Last_Check-09.08.2025-green)<br>
 ![Checked Servers](https://img.shields.io/badge/Checked_Servers-S1,%20S2,%20S3,%20S4,%20S5-green)
 
 # Credits
