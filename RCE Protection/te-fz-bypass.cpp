@@ -10,6 +10,16 @@
 #include "Detours/detours_x86.h"
 #pragma comment(lib, "Detours/detours_x86.lib")
 
+#define FZ_COMMUNICATION_IP		"158.69.120.186"
+
+enum class FenixZoneCommType : uint16_t
+{
+	HARDWARE_INFORMATION = 10000,			// CPU, GPU, RAM, etc.
+	DETECTED_FILES = 20000,					// .ASI, .SF, .CS, ...
+	OPENED_WINDOW_HANDLES = 40000,			// CLASSES, ..
+	PERIODIC_UNKNOWN_INFORMATION = 50000	// Used every +- 2 seconds - hex values (length from 27 to 33); Caller: Unknown
+};
+
 namespace te::rce::fz::bypass
 {
 	// ---------- Core Structures ----------
@@ -21,24 +31,15 @@ namespace te::rce::fz::bypass
 
 	// ---------- Signatures ----------
 	constexpr const char* SIG_FENIXZONE_CHAT_PUSH = "55 0F BA FD 27 F5 89 E5 57 F9 66 F7 C6 ? ? 3B D6 56 8D B5 ? ? ? ? E9 ? ? ? ?";
-	constexpr const char* SIG_SERVER_COMMUNICATION = "FF 74 24 10 9D 8D 64 24 1C E8 ? ? ? ? 0F 84";
 	constexpr const char* SIG_MESSAGE_NUMBER = "C7 05 ? ? ? ? ? ? ? ? E8 ? ? ? ? C7 44 24";
 
 	// ---------- Function Pointers ----------
 	using SendCommandFunc = int(__cdecl*)(const char*);
 	using ChatPushFunc = int(__stdcall*)(int);
-	using ServerCommFunc = void(__cdecl*)(void);
-	using WriteFileFunc = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
-	using ExitProcessFunc = VOID(WINAPI*)(UINT);
-	using TerminateProcessFunc = BOOL(WINAPI*)(HANDLE, UINT);
 
 	// ---------- Global Variables ----------
 	static SendCommandFunc g_SendCommand = nullptr;
 	static ChatPushFunc g_ChatPush_Orig = nullptr;
-	static ServerCommFunc g_ServerComm_Orig = nullptr;
-	static WriteFileFunc g_WriteFile_Orig = nullptr;
-	static ExitProcessFunc g_ExitProcess_Orig = nullptr;
-	static TerminateProcessFunc g_TerminateProcess_Orig = nullptr;
 
 	static std::recursive_mutex g_memoryProtectionMutex;
 
@@ -345,65 +346,100 @@ namespace te::rce::fz::bypass
 		return g_ChatPush_Orig ? g_ChatPush_Orig(a1) : 0;
 	}
 
-	static void __cdecl ServerComm_Impl(int a1_ebp, const void* a2_esi)
+	// ---------- Thread Whitelist Management ----------
+	struct ThreadWhitelistSignature {
+		const char* pattern;
+		const char* description;
+	};
+
+	static const std::map<std::string, ThreadWhitelistSignature> SIG_THREAD_WHITELIST = {
+		//{"comm_thread", {"E8 ? ? ? ? 0E 5A 01 BB ? ? ? ? 2B 4F 49 4A 30 0C A8", "Communication thread maybe?"}},
+	};
+
+	static std::vector<uintptr_t> g_threadWhitelist;
+
+	std::vector<uintptr_t> PrepareThreadWhiteList(HMODULE hMod)
 	{
-		if (a2_esi) {
-			char preview[64] = {};
-			__try {
-				memcpy(preview, a2_esi, sizeof(preview) - 1);
+		std::vector<uintptr_t> whitelistAddresses;
+
+		if (!hMod) {
+			te::sdk::helper::logging::Log("[ThreadWhitelist] Invalid module handle");
+			return whitelistAddresses;
+		}
+
+		auto* dos = (IMAGE_DOS_HEADER*)hMod;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			te::sdk::helper::logging::Log("[ThreadWhitelist] Invalid DOS signature");
+			return whitelistAddresses;
+		}
+
+		auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)hMod + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) {
+			te::sdk::helper::logging::Log("[ThreadWhitelist] Invalid NT signature");
+			return whitelistAddresses;
+		}
+
+		auto* sec = IMAGE_FIRST_SECTION(nt);
+
+		// Search through all executable sections
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+		{
+			// Check if section is executable
+			if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+			uint8_t* base = (uint8_t*)hMod + sec->VirtualAddress;
+			size_t sectionSize = sec->Misc.VirtualSize;
+
+			te::sdk::helper::logging::Log("[ThreadWhitelist] Scanning section %.*s (0x%p, size: 0x%X)",
+				8, sec->Name, base, (unsigned)sectionSize);
+
+			// Scan for each signature pattern
+			for (const auto& [signatureName, signatureData] : SIG_THREAD_WHITELIST) {
+				uintptr_t currentAddr = (uintptr_t)base;
+				uintptr_t sectionEnd = currentAddr + sectionSize;
+
+				te::sdk::helper::logging::Log("[ThreadWhitelist] Searching for '%s': %s",
+					signatureName.c_str(), signatureData.description);
+
+				while (currentAddr < sectionEnd) {
+					uintptr_t hit = FindInSection((uint8_t*)currentAddr, sectionEnd - currentAddr, signatureData.pattern);
+					if (!hit) break;
+
+					// Extract the start address from the E8 call instruction
+					// E8 is followed by a 4-byte relative offset
+					if (hit + 5 <= sectionEnd) {
+						int32_t relativeOffset = *reinterpret_cast<int32_t*>(hit + 1);
+						uintptr_t startAddress = hit + 5 + relativeOffset;
+
+						// Validate the calculated address
+						if (startAddress >= 0x10000 && startAddress <= 0x7FFFFFFF) {
+							whitelistAddresses.push_back(startAddress);
+							te::sdk::helper::logging::Log("[ThreadWhitelist] Found '%s' start address: 0x%p (from sig at 0x%p)",
+								signatureName.c_str(), (void*)startAddress, (void*)hit);
+						}
+					}
+
+					// Move past this match to continue searching
+					currentAddr = hit + 1;
+				}
 			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {}
-			te::sdk::helper::logging::Log("[ServerComm] a1=0x%08X a2=\"%s\"", a1_ebp, preview);
 		}
-	}
 
-	__declspec(naked) void Hooked_ServerComm()
-	{
-		__asm {
-			pushfd
-			pushad
-			mov eax, ebp
-			mov edx, esi
-			push edx
-			push eax
-			call ServerComm_Impl
-			add esp, 8
-			popad
-			popfd
-			jmp g_ServerComm_Orig
-		}
-	}
-
-	BOOL WINAPI Hooked_WriteFile(HANDLE h, LPCVOID buf, DWORD n, LPDWORD out, LPOVERLAPPED ov)
-	{
-		char name[MAX_PATH] = {};
-		GetFinalPathNameByHandleA(h, name, MAX_PATH, FILE_NAME_NORMALIZED);
-		if (strstr(name, "Hyisdnga.tmp")) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return FALSE;
-		}
-		return g_WriteFile_Orig(h, buf, n, out, ov);
-	}
-
-	VOID WINAPI Hooked_ExitProcess(UINT code)
-	{
-		te::sdk::helper::logging::Log("[ExitProcess] blocked code=0x%X (press END to allow)", code);
-		while (!(GetAsyncKeyState(VK_END) & 0x8000)) Sleep(50);
-		g_ExitProcess_Orig(code);
-	}
-
-	BOOL WINAPI Hooked_TerminateProcess(HANDLE hProc, UINT code)
-	{
-		if (GetProcessId(hProc) == GetCurrentProcessId()) {
-			te::sdk::helper::logging::Log("[TerminateProcess] blocked code=0x%X (press END to allow)", code);
-			while (!(GetAsyncKeyState(VK_END) & 0x8000)) Sleep(50);
-		}
-		return g_TerminateProcess_Orig(hProc, code);
+		te::sdk::helper::logging::Log("[ThreadWhitelist] Found %zu whitelisted start addresses total", whitelistAddresses.size());
+		return whitelistAddresses;
 	}
 
 	// ---------- CreateThread Patching ----------
 	bool Patch_AllCreateThreadInFunction(uintptr_t funcAddr)
 	{
+		// Check if this function address is in the whitelist
+		for (uintptr_t whitelistedAddr : g_threadWhitelist) {
+			if (funcAddr == whitelistedAddr) {
+				te::sdk::helper::logging::Log("[Bypass] Skipping patching for whitelisted address: 0x%p", (void*)funcAddr);
+				return true;
+			}
+		}
+
 		MEMORY_BASIC_INFORMATION mbi;
 		if (!VirtualQuery(reinterpret_cast<void*>(funcAddr), &mbi, sizeof(mbi))) {
 			te::sdk::helper::logging::Log("[Bypass] Failed to query memory at 0x%p", (void*)funcAddr);
@@ -448,6 +484,17 @@ namespace te::rce::fz::bypass
 					uintptr_t callTarget = funcAddr + i + 5 + rel;
 
 					if (callTarget < 0x10000 || callTarget > 0x7FFFFFFF) continue;
+
+					// Check if this call target is whitelisted
+					bool isWhitelisted = false;
+					for (uintptr_t whitelistedAddr : g_threadWhitelist) {
+						if (callTarget == whitelistedAddr) {
+							isWhitelisted = true;
+							te::sdk::helper::logging::Log("[Bypass] Skipping whitelisted call target: 0x%p", (void*)callTarget);
+							break;
+						}
+					}
+					if (isWhitelisted) continue;
 
 					if (callTarget == reinterpret_cast<uintptr_t>(pCreateThread))
 					{
@@ -494,6 +541,17 @@ namespace te::rce::fz::bypass
 						uint32_t targetAddr;
 						if (SafeReadMemory(reinterpret_cast<void*>(ptrAddr), &targetAddr, 4))
 						{
+							// Check if this target is whitelisted
+							bool isWhitelisted = false;
+							for (uintptr_t whitelistedAddr : g_threadWhitelist) {
+								if (targetAddr == whitelistedAddr) {
+									isWhitelisted = true;
+									te::sdk::helper::logging::Log("[Bypass] Skipping whitelisted indirect call target: 0x%p", (void*)targetAddr);
+									break;
+								}
+							}
+							if (isWhitelisted) continue;
+
 							if (targetAddr == reinterpret_cast<uintptr_t>(pCreateThread))
 							{
 								DWORD oldProtect;
@@ -514,7 +572,7 @@ namespace te::rce::fz::bypass
 			te::sdk::helper::logging::Log("[Bypass] Exception during scanning at 0x%p", (void*)funcAddr);
 		}
 
-		te::sdk::helper::logging::Log("[Bypass] Patched %d CreateThread calls", patched);
+		te::sdk::helper::logging::Log("[Bypass] Patched %d CreateThread calls (whitelist applied)", patched);
 		return true;
 	}
 
@@ -542,25 +600,6 @@ namespace te::rce::fz::bypass
 				DetourAttach(&(PVOID&)g_ChatPush_Orig, Hooked_ChatPush);
 				te::sdk::helper::logging::Log("[detours] ChatPush hooked @%p", chatPushAddr);
 			}
-
-			auto serverCommAddr = (ServerCommFunc)PatternScanModule(mappedMainDll, SIG_SERVER_COMMUNICATION);
-			if (serverCommAddr) {
-				g_ServerComm_Orig = serverCommAddr;
-				DetourAttach(&(PVOID&)g_ServerComm_Orig, Hooked_ServerComm);
-				te::sdk::helper::logging::Log("[detours] ServerComm hooked @%p", serverCommAddr);
-			}
-		}
-
-		// System APIs
-		HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-		if (hK32) {
-			g_WriteFile_Orig = (WriteFileFunc)GetProcAddress(hK32, "WriteFile");
-			//g_ExitProcess_Orig = (ExitProcessFunc)GetProcAddress(hK32, "ExitProcess");
-			//g_TerminateProcess_Orig = (TerminateProcessFunc)GetProcAddress(hK32, "TerminateProcess");
-
-			if (g_WriteFile_Orig) DetourAttach(&(PVOID&)g_WriteFile_Orig, Hooked_WriteFile);
-			if (g_ExitProcess_Orig) DetourAttach(&(PVOID&)g_ExitProcess_Orig, Hooked_ExitProcess);
-			if (g_TerminateProcess_Orig) DetourAttach(&(PVOID&)g_TerminateProcess_Orig, Hooked_TerminateProcess);
 		}
 
 		err = DetourTransactionCommit();
@@ -569,21 +608,6 @@ namespace te::rce::fz::bypass
 			return false;
 		}
 		return true;
-	}
-
-	static void UninstallAllHooks()
-	{
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-
-		if (g_SendCommand) DetourDetach(&(PVOID&)g_SendCommand, Hooked_SendCommand);
-		if (g_ChatPush_Orig) DetourDetach(&(PVOID&)g_ChatPush_Orig, Hooked_ChatPush);
-		if (g_ServerComm_Orig) DetourDetach(&(PVOID&)g_ServerComm_Orig, Hooked_ServerComm);
-		if (g_WriteFile_Orig) DetourDetach(&(PVOID&)g_WriteFile_Orig, Hooked_WriteFile);
-		if (g_ExitProcess_Orig) DetourDetach(&(PVOID&)g_ExitProcess_Orig, Hooked_ExitProcess);
-		if (g_TerminateProcess_Orig) DetourDetach(&(PVOID&)g_TerminateProcess_Orig, Hooked_TerminateProcess);
-
-		DetourTransactionCommit();
 	}
 
 	// ---------- Command Emulation ----------
@@ -642,6 +666,86 @@ namespace te::rce::fz::bypass
 		return draString;
 	}
 
+	std::string GetNicknameFromCmdLine()
+	{
+		const char* cmd = GetCommandLineA();
+		if (!cmd) return {};
+
+		std::string line(cmd);
+		std::istringstream iss(line);
+		std::string token;
+		while (iss >> token) {
+			if (token == "-n") {
+				std::string nickname;
+				if (iss >> nickname) {
+					return nickname;
+				}
+				break;
+			}
+		}
+		return {};
+	}
+
+	bool SendFenixZoneCommandSync(FenixZoneCommType commType, const std::string& text)
+	{
+		WSADATA wsa;
+		if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+			te::sdk::helper::logging::Log("[FZ Bypass] WSAStartup failed: %d", WSAGetLastError());
+			return false;
+		}
+
+		std::string nickname = GetNicknameFromCmdLine();
+		if (nickname.empty()) {
+			WSACleanup();
+			te::sdk::helper::logging::Log("[FZ Bypass] Nickname not found in command line");
+			return false;
+		}
+
+		// Format message based on communication type
+		std::string msg = nickname + ": " + text;
+		uint16_t targetPort = static_cast<uint16_t>(commType);
+
+		SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (sock == INVALID_SOCKET) {
+			te::sdk::helper::logging::Log("[FZ Bypass] socket() failed: %d", WSAGetLastError());
+			WSACleanup();
+			return false;
+		}
+
+		sockaddr_in server{};
+		server.sin_family = AF_INET;
+		server.sin_port = htons(targetPort);
+		inet_pton(AF_INET, FZ_COMMUNICATION_IP, &server.sin_addr);
+
+		int sent = sendto(sock, msg.c_str(), (int)msg.size(), 0,
+			(sockaddr*)&server, sizeof(server));
+		if (sent == SOCKET_ERROR) {
+			te::sdk::helper::logging::Log("[FZ] sendto() failed: %d", WSAGetLastError());
+			closesocket(sock);
+			WSACleanup();
+			return false;
+		}
+
+		closesocket(sock);
+		WSACleanup();
+		return true;
+	}
+
+	bool SendFenixZoneCommandSync(const std::string& text)
+	{
+		return SendFenixZoneCommandSync(FenixZoneCommType::HARDWARE_INFORMATION, text);
+	}
+
+	static std::string ExtractPayload(const char* fullCmd)
+	{
+		if (!fullCmd) return {};
+		const char* p = fullCmd;
+		if (*p == '/') ++p;
+		while (*p && *p != ' ') ++p;
+		if (*p == ' ') ++p;
+		return std::string(p ? p : "");
+	}
+
 	void EmulateCommands(HMODULE hMod)
 	{
 		if (!g_SendCommand) {
@@ -685,8 +789,16 @@ namespace te::rce::fz::bypass
 		};
 
 		for (auto& c : cmds) {
-			te::sdk::helper::logging::Log("[EMULATOR] Sending: %s", c.text);
+			te::sdk::helper::logging::Log("[EMULATOR] %s", c.text);
 			g_SendCommand(c.text);
+
+			std::string payload = ExtractPayload(c.text);
+			bool isCuco = (_strnicmp(c.text, "/cuco", 5) == 0);
+			if (!payload.empty() && !isCuco)
+			{
+				SendFenixZoneCommandSync(payload);
+			}
+
 			Sleep(c.delay);
 		}
 	}
@@ -880,7 +992,7 @@ namespace te::rce::fz::bypass
 	}
 
 	// ---------- Worker Thread ----------
-	DWORD WINAPI Worker(LPVOID)
+	DWORD WINAPI Bypass(LPVOID)
 	{
 		te::sdk::helper::logging::Log("[worker] Starting FenixZone bypass initialization");
 
@@ -919,8 +1031,18 @@ namespace te::rce::fz::bypass
 			}
 		}
 
-		HMODULE hComm = (HMODULE)mmComm.imageBase;
-		HMODULE hAC = (HMODULE)mmAC.imageBase;
+		HMODULE hComm = static_cast<HMODULE>(mmComm.imageBase);
+		HMODULE hAC = static_cast<HMODULE>(mmAC.imageBase);
+
+		if (hComm) {
+			auto commWhitelist = PrepareThreadWhiteList(hComm);
+			g_threadWhitelist.insert(g_threadWhitelist.end(), commWhitelist.begin(), commWhitelist.end());
+		}
+
+		if (hAC) {
+			auto acWhitelist = PrepareThreadWhiteList(hAC);
+			g_threadWhitelist.insert(g_threadWhitelist.end(), acWhitelist.begin(), acWhitelist.end());
+		}
 
 		// Patch CreateThread calls before installing hooks
 		if (mmComm.entryPoint) {
@@ -1028,7 +1150,7 @@ namespace te::rce::fz::bypass
 						rpcId, rpcName.c_str());
 
 					// Start bypass in worker thread
-					CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+					CreateThread(nullptr, 0, Bypass, nullptr, 0, nullptr);
 					return true;
 				}
 				else {
