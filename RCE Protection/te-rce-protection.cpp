@@ -5,6 +5,11 @@
 
 namespace te::rce::helper
 {
+	struct ShellcodePattern {
+		std::vector<uint8_t> signature;
+		std::string description;
+	};
+
 	std::vector<RPC> rpcListInBits = {
 	{
 		84, "SetPlayerObjectMaterial(Text)",
@@ -308,6 +313,67 @@ namespace te::rce::helper
 		return 0;
 	}
 
+	static const std::vector<ShellcodePattern> SHELLCODE_SIGNATURES = {
+		// Common x86 shellcode patterns
+		{{0x31, 0xC0}, "XOR EAX, EAX"},
+		{{0x50, 0x68}, "PUSH + PUSH (stack setup)"},
+		{{0xEB, 0xFE}, "JMP $ (infinite loop)"},
+		{{0x90, 0x90, 0x90, 0x90}, "NOP sled"},
+		{{0xCC, 0xCC, 0xCC, 0xCC}, "INT3 breakpoint"},
+		// Windows API hashing patterns
+		{{0x64, 0x8B, 0x25}, "MOV ESP, FS:[offset] (TEB access)"},
+		{{0x8B, 0x52, 0x0C}, "MOV EDX, [EDX+0Ch] (PEB traversal)"},
+	};
+
+	bool DetectShellcodePatterns(const std::vector<unsigned char>& data) {
+		if (data.size() < 4) return false;
+
+		// Check for common shellcode signatures
+		for (const auto& pattern : SHELLCODE_SIGNATURES) {
+			for (size_t i = 0; i <= data.size() - pattern.signature.size(); ++i) {
+				bool match = true;
+				for (size_t j = 0; j < pattern.signature.size(); ++j) {
+					if (data[i + j] != pattern.signature[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (match) {
+					te::sdk::helper::logging::Log("[SHELLCODE] Detected pattern: %s at offset %zu",
+						pattern.description.c_str(), i);
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	bool DetectSuspiciousInstructions(const std::vector<unsigned char>& data) {
+		size_t suspiciousCount = 0;
+
+		for (size_t i = 0; i < data.size() - 1; ++i) {
+			// Look for syscall instructions
+			if (data[i] == 0x0F && data[i + 1] == 0x05) { // SYSCALL
+				suspiciousCount++;
+			}
+			// Look for interrupt instructions
+			else if (data[i] == 0xCD && i + 1 < data.size()) { // INT xx
+				suspiciousCount++;
+			}
+			// Look for call/jmp with register operands (common in shellcode)
+			else if ((data[i] == 0xFF) && i + 1 < data.size()) {
+				uint8_t modrm = data[i + 1];
+				if ((modrm & 0x38) >= 0x10 && (modrm & 0x38) <= 0x28) { // CALL/JMP reg
+					suspiciousCount++;
+				}
+			}
+		}
+
+		// If more than 10% of instructions are suspicious
+		return (suspiciousCount * 10 > data.size());
+	}
+
 	bool CheckRPC(int rpcId, BitStream* bs)
 	{
 		try
@@ -318,6 +384,34 @@ namespace te::rce::helper
 			}
 
 			auto numberOfBits = bs->GetNumberOfUnreadBits();
+
+			//std::vector<unsigned char> allData(bs->GetNumberOfBytesUsed());
+			//int originalOffset = bs->GetReadOffset();
+			//bs->SetReadOffset(0);
+			//bs->Read(reinterpret_cast<char*>(allData.data()), allData.size());
+			//bs->SetReadOffset(originalOffset);
+
+			//// Enhanced shellcode detection
+			//if (allData.size() > 100) { // Only check larger payloads
+			//	// Check entropy (existing)
+			//	double entropy = calculateEntropy(allData);
+			//	if (entropy > 7.5) { // Stricter threshold for large payloads
+			//		te::sdk::helper::logging::Log("[SHELLCODE] High entropy detected: %.2f", entropy);
+			//		return false;
+			//	}
+
+			//	// Check for shellcode patterns
+			//	if (DetectShellcodePatterns(allData)) {
+			//		te::sdk::helper::logging::Log("[SHELLCODE] Suspicious instruction patterns detected");
+			//		return false;
+			//	}
+
+			//	// Check for suspicious instruction frequency
+			//	if (DetectSuspiciousInstructions(allData)) {
+			//		te::sdk::helper::logging::Log("[SHELLCODE] High frequency of suspicious instructions");
+			//		return false;
+			//	}
+			//}
 
 			switch (rpcId)
 			{
@@ -369,8 +463,8 @@ namespace te::rce::helper
 					te::sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in ShowDialog RPC: %d bits, expected at most %d bits.",
 						numberOfBits, maxSize);
 
-					te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC");
-					return false; // Block - possible RCE attempt
+					auto peFound = te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC");
+					return !peFound; // Block || Process - possible RCE attempt ? [ peFound == true ? block : allow ]
 				}
 				break;
 			}

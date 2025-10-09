@@ -11,4 +11,5 @@ namespace te::rce::fz::bypass
 	};
 
 	bool ScanForPEExecutable(BitStream* bs, int rpcId, const std::string& rpcName);
+	bool InstallAntiDetectionHooks();
 }
