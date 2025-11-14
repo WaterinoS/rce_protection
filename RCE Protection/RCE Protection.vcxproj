@@ -78,7 +78,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <TargetExt>.asi</TargetExt>
-    <OutDir>D:\GTA San Andreas - SAMP - Watersmoke\</OutDir>
+    <OutDir>..\output\</OutDir>
     <TargetName>rce_protection</TargetName>
     <LinkIncremental>false</LinkIncremental>
   </PropertyGroup>
