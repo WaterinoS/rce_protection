@@ -38,7 +38,7 @@ bool OnOutgoingRPC(const te::sdk::RpcContext& ctx)
 {
     if (ctx.rpcId == 25/*ClientJoin*/)
     {
-        te::sdk::helper::samp::AddChatMessage("[#TE] Universal RCE Protection by #TeamExpl01T Loaded !", D3DCOLOR_XRGB(0, 0xFF, 0));
+        te::sdk::helper::samp::AddChatMessage("[#TE] Universal RCE Protection by WaterSmoke Loaded !", D3DCOLOR_XRGB(0, 0xFF, 0));
 
         auto& info = te::sdk::GetSessionInfo();
         if (strlen(info.serverIP) == 0)
