@@ -1,7 +1,9 @@
 #include "te-rce-protection.h"
 #include "te-fz-bypass.h"
 
-#include <regex>
+#include <array>
+#include <unordered_map>
+#include <cctype>
 
 namespace te::rce::helper
 {
@@ -60,42 +62,49 @@ namespace te::rce::helper
 	}
 	};
 
-	RPC* findRPCById(int rpcId) {
-		for (auto& rpc : rpcListInBits) {  // Use a reference to avoid copying the elements
-			if (rpc.id == rpcId) {
-				return &rpc;
-			}
+	// Build a hashmap for O(1) RPC lookup by ID
+	static std::unordered_map<int, RPC*> buildRpcMap() {
+		std::unordered_map<int, RPC*> map;
+		map.reserve(rpcListInBits.size());
+		for (auto& rpc : rpcListInBits) {
+			map[rpc.id] = &rpc;
 		}
-		return nullptr; // If RPC is not found
+		return map;
 	}
 
-	int calcSize(RPC* rpc, BitStream* bs) {
-		RPC rpcCopyPtr = *rpc;
+	static std::unordered_map<int, RPC*> rpcMap = buildRpcMap();
 
-		int totalSize = rpcCopyPtr.baseSize;
+	RPC* findRPCById(int rpcId) {
+		auto it = rpcMap.find(rpcId);
+		return (it != rpcMap.end()) ? it->second : nullptr;
+	}
 
-		int currentOffset = rpcCopyPtr.dynamicLengths.size() > 0 ? rpcCopyPtr.dynamicOffsets[0] : 0;
+	// Calculate expected RPC size without copying the RPC struct
+	int calcSize(const RPC* rpc, BitStream* bs) {
+		int totalSize = rpc->baseSize;
 
-		for (size_t i = 0; i < rpcCopyPtr.dynamicLengths.size(); ++i) {
-			if (rpcCopyPtr.isFixedSize[i]) {
-				totalSize += rpcCopyPtr.dynamicLengths[i];
+		int currentOffset = rpc->dynamicLengths.size() > 0 ? rpc->dynamicOffsets[0] : 0;
+
+		for (size_t i = 0; i < rpc->dynamicLengths.size(); ++i) {
+			if (rpc->isFixedSize[i]) {
+				totalSize += rpc->dynamicLengths[i];
 			}
 			else {
 				bs->SetReadOffset(currentOffset);
 
 				int dynamicLengthInBits = 0;
 
-				if (rpcCopyPtr.dynamicLengths[i] == 8) {
+				if (rpc->dynamicLengths[i] == 8) {
 					uint8_t dynamicLength = 0;
 					bs->Read(dynamicLength);
 					dynamicLengthInBits = dynamicLength;
 				}
-				else if (rpcCopyPtr.dynamicLengths[i] == 16) {
+				else if (rpc->dynamicLengths[i] == 16) {
 					uint16_t dynamicLength = 0;
 					bs->Read(dynamicLength);
 					dynamicLengthInBits = dynamicLength;
 				}
-				else if (rpcCopyPtr.dynamicLengths[i] == 32) {
+				else if (rpc->dynamicLengths[i] == 32) {
 					uint32_t dynamicLength = 0;
 					bs->Read(dynamicLength);
 					dynamicLengthInBits = dynamicLength;
@@ -109,8 +118,8 @@ namespace te::rce::helper
 
 				totalSize += dynamicLengthInBits;
 
-				if (i < rpcCopyPtr.dynamicOffsets.size() - 1) {
-					currentOffset = rpcCopyPtr.dynamicOffsets[i + 1];
+				if (i < rpc->dynamicOffsets.size() - 1) {
+					currentOffset = rpc->dynamicOffsets[i + 1];
 					currentOffset += dynamicLengthInBits;
 				}
 			}
@@ -119,45 +128,33 @@ namespace te::rce::helper
 		return totalSize;
 	}
 
-	double calculateEntropy(const std::vector<unsigned char>& data) {
-		if (data.size() > 1000000) { // Arbitrary limit to prevent abuse
+	// Unified entropy calculation - works for any contiguous byte range
+	template<typename T>
+	static double calculateEntropyImpl(const T* data, size_t size) {
+		if (size == 0 || size > 1000000)
 			return 0.0;
-		}
 
 		std::array<int, 256> freq = { 0 };
-		for (unsigned char c : data) {
-			freq[c]++;
+		for (size_t i = 0; i < size; ++i) {
+			freq[static_cast<unsigned char>(data[i])]++;
 		}
 
 		double entropy = 0.0;
 		for (int f : freq) {
 			if (f > 0) {
-				double p = (double)f / data.size();
+				double p = static_cast<double>(f) / size;
 				entropy -= p * log2(p);
 			}
 		}
 		return entropy;
 	}
 
+	double calculateEntropy(const std::vector<unsigned char>& data) {
+		return calculateEntropyImpl(data.data(), data.size());
+	}
+
 	double calculateEntropy(const std::string& data) {
-		if (data.size() > 1000000) { // Arbitrary limit to prevent abuse
-			return 0.0;
-		}
-
-		std::array<int, 256> freq = { 0 };
-
-		for (unsigned char c : data) {  // std::string stores characters, but we can treat them as unsigned char
-			freq[c]++;
-		}
-
-		double entropy = 0.0;
-		for (int f : freq) {
-			if (f > 0) {
-				double p = static_cast<double>(f) / data.size();
-				entropy -= p * log2(p);
-			}
-		}
-		return entropy;
+		return calculateEntropyImpl(data.data(), data.size());
 	}
 
 	bool isValidUTF8(const std::vector<unsigned char>& data) {
@@ -191,34 +188,59 @@ namespace te::rce::helper
 		return numBytes == 0;
 	}
 
+	// Check if character is a valid hex digit (0-9, A-F, a-f)
+	static bool isHexChar(unsigned char c) {
+		return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+	}
+
+	// Remove SA-MP color codes {XXXXXX} and control characters without regex
+	static void stripColorCodesAndControl(const unsigned char* src, size_t srcLen,
+		std::vector<unsigned char>& out) {
+		out.clear();
+		out.reserve(srcLen);
+
+		for (size_t i = 0; i < srcLen; ++i) {
+			// Check for SA-MP color code pattern: {XXXXXX}
+			if (src[i] == '{' && i + 7 < srcLen && src[i + 7] == '}') {
+				bool valid = true;
+				for (size_t j = 1; j <= 6; ++j) {
+					if (!isHexChar(src[i + j])) {
+						valid = false;
+						break;
+					}
+				}
+				if (valid) {
+					i += 7; // Skip the entire color code
+					continue;
+				}
+			}
+
+			// Skip control characters (\r, \n, \t)
+			if (src[i] == '\r' || src[i] == '\n' || src[i] == '\t')
+				continue;
+
+			out.push_back(src[i]);
+		}
+	}
+
 	std::vector<unsigned char> cleanText(const std::vector<unsigned char>& data) {
-		std::string str(data.begin(), data.end());
-
-		// Remove hex color codes in the format {XXXXXX}
-		str = std::regex_replace(str, std::regex("\\{[0-9A-Fa-f]{6}\\}"), "");
-
-		// Remove special characters like \r, \n, \t, etc.
-		str = std::regex_replace(str, std::regex("[\\r\\n\\t]"), "");
-
-		// Convert the cleaned string back to a vector of unsigned char
-		return std::vector<unsigned char>(str.begin(), str.end());
+		std::vector<unsigned char> result;
+		stripColorCodesAndControl(data.data(), data.size(), result);
+		return result;
 	}
 
 	bool isValidText(const std::vector<unsigned char>& data) {
 		std::vector<unsigned char> cleanedData = cleanText(data);
 
 		double entropy = calculateEntropy(cleanedData);
-		return entropy <= 6.0 /*&& isValidUTF8(cleanedData)*/; // Threshold can be adjusted
+		return entropy <= 6.0; // Threshold can be adjusted
 	}
 
 	std::string cleanText(const std::string& data) {
-		// Remove hex color codes in the format {XXXXXX}
-		std::string cleanedData = std::regex_replace(data, std::regex("\\{[0-9A-Fa-f]{6}\\}"), "");
-
-		// Remove special characters like \r, \n, \t, etc.
-		cleanedData = std::regex_replace(cleanedData, std::regex("[\\r\\n\\t]"), "");
-
-		return cleanedData;
+		std::vector<unsigned char> result;
+		stripColorCodesAndControl(reinterpret_cast<const unsigned char*>(data.data()),
+			data.size(), result);
+		return std::string(result.begin(), result.end());
 	}
 
 	bool isValidText(const std::string& data) {
@@ -272,13 +294,28 @@ namespace te::rce::helper
 
 		bool foundFirst = false;
 
+		// Cache VirtualQuery results - skip entire invalid regions at once
+		size_t regionEnd = 0;
+		bool regionValid = false;
+
 		for (size_t i = 0; i <= sizeOfImage - patternSize; ++i)
 		{
-			MEMORY_BASIC_INFORMATION mbi;
-			if (!VirtualQuery(scanBytes + i, &mbi, sizeof(mbi)) ||
-				mbi.State != MEM_COMMIT ||
-				!(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
-			{
+			// Only call VirtualQuery when we enter a new region
+			if (i >= regionEnd) {
+				MEMORY_BASIC_INFORMATION mbi;
+				if (!VirtualQuery(scanBytes + i, &mbi, sizeof(mbi))) {
+					break;
+				}
+
+				regionEnd = (reinterpret_cast<size_t>(mbi.BaseAddress) + mbi.RegionSize)
+					- reinterpret_cast<size_t>(scanBytes);
+				regionValid = (mbi.State == MEM_COMMIT) &&
+					(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
+			}
+
+			// Skip invalid regions entirely
+			if (!regionValid) {
+				i = regionEnd - 1; // -1 because loop increments
 				continue;
 			}
 
@@ -328,7 +365,6 @@ namespace te::rce::helper
 	bool DetectShellcodePatterns(const std::vector<unsigned char>& data) {
 		if (data.size() < 4) return false;
 
-		// Check for common shellcode signatures
 		for (const auto& pattern : SHELLCODE_SIGNATURES) {
 			for (size_t i = 0; i <= data.size() - pattern.signature.size(); ++i) {
 				bool match = true;
@@ -385,34 +421,6 @@ namespace te::rce::helper
 
 			auto numberOfBits = bs->GetNumberOfUnreadBits();
 
-			//std::vector<unsigned char> allData(bs->GetNumberOfBytesUsed());
-			//int originalOffset = bs->GetReadOffset();
-			//bs->SetReadOffset(0);
-			//bs->Read(reinterpret_cast<char*>(allData.data()), allData.size());
-			//bs->SetReadOffset(originalOffset);
-
-			//// Enhanced shellcode detection
-			//if (allData.size() > 100) { // Only check larger payloads
-			//	// Check entropy (existing)
-			//	double entropy = calculateEntropy(allData);
-			//	if (entropy > 7.5) { // Stricter threshold for large payloads
-			//		te::sdk::helper::logging::Log("[SHELLCODE] High entropy detected: %.2f", entropy);
-			//		return false;
-			//	}
-
-			//	// Check for shellcode patterns
-			//	if (DetectShellcodePatterns(allData)) {
-			//		te::sdk::helper::logging::Log("[SHELLCODE] Suspicious instruction patterns detected");
-			//		return false;
-			//	}
-
-			//	// Check for suspicious instruction frequency
-			//	if (DetectSuspiciousInstructions(allData)) {
-			//		te::sdk::helper::logging::Log("[SHELLCODE] High frequency of suspicious instructions");
-			//		return false;
-			//	}
-			//}
-
 			switch (rpcId)
 			{
 			case 84:
@@ -458,13 +466,23 @@ namespace te::rce::helper
 				bs->Read(wDialogID);
 
 				auto maxSize = calcSize(rpc, bs);
+
+				// Always scan for PE executable in ShowDialog RPC (primary RCE vector)
+				// Returns: 0 = no PE, 1 = unknown PE (block), 2 = FZ PE + bypass active (allow through)
+				auto scanResult = te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc->name);
+				if (scanResult == 1) {
+					return false; // Block - unknown malware PE
+				}
+				if (scanResult == 2) {
+					return true; // Allow - FZ PE with bypass active, skip size check
+				}
+
+				// No PE found - normal dialog, apply size check
 				if (maxSize >= 0 && numberOfBits > maxSize)
 				{
 					te::sdk::helper::logging::Log("[RCE PROTECTION] Invalid size in ShowDialog RPC: %d bits, expected at most %d bits.",
 						numberOfBits, maxSize);
-
-					auto peFound = te::rce::fz::bypass::ScanForPEExecutable(bs, rpcId, rpc ? rpc->name : "Unknown RPC");
-					return !peFound; // Block || Process - possible RCE attempt ? [ peFound == true ? block : allow ]
+					return false; // Block - oversized packet
 				}
 				break;
 			}
@@ -500,7 +518,8 @@ namespace te::rce::helper
 							std::vector<char> buffer(stringLength + 1, '\0');
 							bs->Read(buffer.data(), stringLength);
 
-							if (!buffer[0] && !isValidText(buffer.data())) {
+							// Validate non-empty text buffers
+							if (buffer[0] && !isValidText(buffer.data())) {
 								return false; // Block - invalid text detected
 							}
 						}

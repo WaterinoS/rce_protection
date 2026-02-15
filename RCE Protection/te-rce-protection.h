@@ -1,5 +1,6 @@
 #pragma once
 #include "te-sdk.h"
+using namespace RakNet;
 
 namespace te::rce::helper
 {
