@@ -18,6 +18,7 @@
 #include <MinHook.h>
 
 #include <winternl.h>
+#include <intrin.h>
 
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS                   ((NTSTATUS)0x00000000L)
@@ -740,6 +741,7 @@ namespace te::rce::fz::bypass
 		return true;
 	}
 	BOOL WINAPI Hooked_VirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect);
+	static bool InstallHWIDSpoofHooks();
 	bool InstallAntiDetectionHooks()
 	{
 		if (g_hooksInitialized) {
@@ -829,6 +831,10 @@ namespace te::rce::fz::bypass
 		}
 
 		te::sdk::helper::logging::Log("[#TE] All %d hooks installed successfully (MinHook)", hookCount);
+
+		// Install HWID spoofing hooks (API-level hardware enumeration spoofing)
+		InstallHWIDSpoofHooks();
+
 		return true;
 	}
 
@@ -928,6 +934,304 @@ namespace te::rce::fz::bypass
 		return result;
 	}
 
+	// ---------- HWID Spoofing (API-level) ----------
+	// Hooks hardware enumeration APIs to return spoofed values when called from FZ code.
+	// Values are generated once per session for consistency.
+
+	struct SpoofedHWID {
+		DWORD volumeSerial;
+		char volumeSerialStr[16];
+		char driveSerial[64];
+		char gpuName[128];
+		char cpuBrand[64];
+		DWORD totalRAM_KB;
+		DWORD processorCount;
+		int keyboardType;
+		int keyboardSubType;
+		int keyboardFuncKeys;
+		bool initialized;
+	};
+
+	static SpoofedHWID g_spoof = {};
+	static uintptr_t g_fzModuleBase = 0;
+	static uintptr_t g_fzModuleSize = 0;
+
+	static void InitSpoofedHWID()
+	{
+		if (g_spoof.initialized) return;
+
+		srand(GetTickCount() ^ 0xDEADBEEF);
+
+		// Volume serial - random 32-bit value
+		g_spoof.volumeSerial = (DWORD)(rand() << 16) | (DWORD)rand();
+		snprintf(g_spoof.volumeSerialStr, sizeof(g_spoof.volumeSerialStr), "%04X-%04X",
+			(g_spoof.volumeSerial >> 16) & 0xFFFF, g_spoof.volumeSerial & 0xFFFF);
+
+		// Physical drive serial - random alphanumeric
+		static const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+		int serialLen = 16 + rand() % 8;
+		for (int i = 0; i < serialLen && i < 63; i++)
+			g_spoof.driveSerial[i] = charset[rand() % (sizeof(charset) - 1)];
+		g_spoof.driveSerial[serialLen] = '\0';
+
+		// GPU name
+		static const char* gpus[] = {
+			"NVIDIA GeForce RTX 4080", "AMD Radeon RX 7900 XTX",
+			"NVIDIA GeForce RTX 3070", "AMD Radeon RX 6800 XT",
+			"NVIDIA GeForce GTX 1660 Ti", "AMD Radeon RX 5700 XT",
+			"NVIDIA GeForce RTX 4060", "NVIDIA GeForce RTX 3060"
+		};
+		strncpy(g_spoof.gpuName, gpus[rand() % 8], sizeof(g_spoof.gpuName) - 1);
+
+		// CPU brand
+		static const char* cpus[] = {
+			"Intel(R) Core(TM) i9-14900K Processor",
+			"AMD Ryzen 9 5900X 12-Core Processor",
+			"Intel(R) Core(TM) i7-13700K Processor",
+			"AMD Ryzen 7 5800X 8-Core Processor",
+			"Intel(R) Core(TM) i5-12600K Processor",
+			"AMD Ryzen 5 5600X 6-Core Processor"
+		};
+		strncpy(g_spoof.cpuBrand, cpus[rand() % 6], sizeof(g_spoof.cpuBrand) - 1);
+
+		// RAM (8-32 GB in KB)
+		g_spoof.totalRAM_KB = (DWORD)(8 + rand() % 25) * 1024 * 1024;
+
+		// Processor count (4-16)
+		g_spoof.processorCount = 4 + rand() % 13;
+
+		// Keyboard type info
+		g_spoof.keyboardType = 4 + rand() % 4;     // Type 4-7
+		g_spoof.keyboardSubType = rand() % 12;      // Subtype
+		g_spoof.keyboardFuncKeys = 12;               // Always 12 function keys
+
+		g_spoof.initialized = true;
+
+		te::sdk::helper::logging::Log("[#TE FZ] HWID spoof initialized: GPU=%s CPU=%s Vol=%s Drive=%s RAM=%uKB Procs=%u",
+			g_spoof.gpuName, g_spoof.cpuBrand, g_spoof.volumeSerialStr,
+			g_spoof.driveSerial, g_spoof.totalRAM_KB, g_spoof.processorCount);
+	}
+
+	// Check if the calling function is within FZ module address range
+	static bool IsCallerFZ(void* retAddr)
+	{
+		if (!g_fzModuleBase || !g_fzModuleSize) return false;
+		auto addr = reinterpret_cast<uintptr_t>(retAddr);
+		return addr >= g_fzModuleBase && addr < g_fzModuleBase + g_fzModuleSize;
+	}
+
+	// Resolve FZ module size from PE header (SizeOfImage)
+	extern "C" uint32_t __stdcall GetPESizeOfImage_SEH(uintptr_t base)
+	{
+		__try {
+			uint32_t peOff = *reinterpret_cast<const uint32_t*>(base + 0x3C);
+			if (peOff == 0 || peOff > 0x1000) return 0;
+			// SizeOfImage is at PE + 0x50 (offset 80 from COFF header start = PE+4+20+56)
+			return *reinterpret_cast<const uint32_t*>(base + peOff + 0x50);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+	}
+
+	// --- P0: Drive serial spoofing ---
+
+	static decltype(&GetVolumeInformationA) o_GetVolumeInformationA = nullptr;
+	static decltype(&DeviceIoControl)       o_DeviceIoControl = nullptr;
+
+	static BOOL WINAPI Hooked_GetVolumeInformationA(
+		LPCSTR lpRootPathName, LPSTR lpVolumeNameBuffer, DWORD nVolumeNameSize,
+		LPDWORD lpVolumeSerialNumber, LPDWORD lpMaximumComponentLength,
+		LPDWORD lpFileSystemFlags, LPSTR lpFileSystemNameBuffer, DWORD nFileSystemNameSize)
+	{
+		BOOL result = o_GetVolumeInformationA(lpRootPathName, lpVolumeNameBuffer, nVolumeNameSize,
+			lpVolumeSerialNumber, lpMaximumComponentLength, lpFileSystemFlags,
+			lpFileSystemNameBuffer, nFileSystemNameSize);
+
+		if (result && g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			if (lpVolumeSerialNumber) {
+				te::sdk::helper::logging::Log("[#TE FZ] GetVolumeInfoA spoofed serial: 0x%08X -> 0x%08X",
+					*lpVolumeSerialNumber, g_spoof.volumeSerial);
+				*lpVolumeSerialNumber = g_spoof.volumeSerial;
+			}
+		}
+		return result;
+	}
+
+	static BOOL WINAPI Hooked_DeviceIoControl(
+		HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize,
+		LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped)
+	{
+		BOOL result = o_DeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize,
+			lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped);
+
+		if (result && g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			// IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+			if (dwIoControlCode == 0x002D1400 && lpOutBuffer && nOutBufferSize >= 48) {
+				// STORAGE_DEVICE_DESCRIPTOR: SerialNumberOffset is at byte offset 12
+				auto desc = reinterpret_cast<uint8_t*>(lpOutBuffer);
+				uint32_t serialOffset = *reinterpret_cast<uint32_t*>(desc + 12);
+				if (serialOffset > 0 && serialOffset < nOutBufferSize - 1) {
+					char* serial = reinterpret_cast<char*>(desc + serialOffset);
+					size_t maxLen = nOutBufferSize - serialOffset - 1;
+					size_t copyLen = strlen(g_spoof.driveSerial);
+					if (copyLen > maxLen) copyLen = maxLen;
+					memcpy(serial, g_spoof.driveSerial, copyLen);
+					serial[copyLen] = '\0';
+					te::sdk::helper::logging::Log("[#TE FZ] DeviceIoControl spoofed drive serial -> %s", g_spoof.driveSerial);
+				}
+			}
+		}
+		return result;
+	}
+
+	// --- P1: Display/Memory/System spoofing ---
+
+	static decltype(&EnumDisplayDevicesA) o_EnumDisplayDevicesA = nullptr;
+
+	static BOOL WINAPI Hooked_EnumDisplayDevicesA(
+		LPCSTR lpDevice, DWORD iDevNum, PDISPLAY_DEVICEA lpDisplayDevice, DWORD dwFlags)
+	{
+		BOOL result = o_EnumDisplayDevicesA(lpDevice, iDevNum, lpDisplayDevice, dwFlags);
+
+		if (result && g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			if (lpDisplayDevice && iDevNum == 0) {
+				te::sdk::helper::logging::Log("[#TE FZ] EnumDisplayDevicesA spoofed: %s -> %s",
+					lpDisplayDevice->DeviceString, g_spoof.gpuName);
+				strncpy(lpDisplayDevice->DeviceString, g_spoof.gpuName,
+					sizeof(lpDisplayDevice->DeviceString) - 1);
+			}
+		}
+		return result;
+	}
+
+	static decltype(&GlobalMemoryStatusEx) o_GlobalMemoryStatusEx = nullptr;
+
+	static BOOL WINAPI Hooked_GlobalMemoryStatusEx(LPMEMORYSTATUSEX lpBuffer)
+	{
+		BOOL result = o_GlobalMemoryStatusEx(lpBuffer);
+
+		if (result && g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			lpBuffer->ullTotalPhys = (DWORDLONG)g_spoof.totalRAM_KB * 1024ULL;
+			te::sdk::helper::logging::Log("[#TE FZ] GlobalMemoryStatusEx spoofed -> %u KB", g_spoof.totalRAM_KB);
+		}
+		return result;
+	}
+
+	static decltype(&GetSystemInfo) o_GetSystemInfo = nullptr;
+
+	static VOID WINAPI Hooked_GetSystemInfo(LPSYSTEM_INFO lpSystemInfo)
+	{
+		o_GetSystemInfo(lpSystemInfo);
+
+		if (g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			lpSystemInfo->dwNumberOfProcessors = g_spoof.processorCount;
+			te::sdk::helper::logging::Log("[#TE FZ] GetSystemInfo spoofed procs -> %u", g_spoof.processorCount);
+		}
+	}
+
+	// --- P2: Keyboard type spoofing ---
+
+	static decltype(&GetKeyboardType) o_GetKeyboardType = nullptr;
+
+	static int WINAPI Hooked_GetKeyboardType(int nTypeFlag)
+	{
+		int result = o_GetKeyboardType(nTypeFlag);
+
+		if (g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			switch (nTypeFlag) {
+			case 0: result = g_spoof.keyboardType; break;
+			case 1: result = g_spoof.keyboardSubType; break;
+			case 2: result = g_spoof.keyboardFuncKeys; break;
+			}
+		}
+		return result;
+	}
+
+	// --- P2: CPU info via registry spoofing ---
+
+	static decltype(&RegQueryValueExA) o_RegQueryValueExA = nullptr;
+
+	static LSTATUS WINAPI Hooked_RegQueryValueExA(
+		HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved,
+		LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData)
+	{
+		LSTATUS result = o_RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+
+		if (result == ERROR_SUCCESS && g_spoof.initialized && IsCallerFZ(_ReturnAddress())) {
+			if (lpValueName && lpData && lpcbData) {
+				// Spoof CPU brand string from HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0
+				if (_stricmp(lpValueName, "ProcessorNameString") == 0) {
+					DWORD needed = (DWORD)strlen(g_spoof.cpuBrand) + 1;
+					if (*lpcbData >= needed) {
+						memcpy(lpData, g_spoof.cpuBrand, needed);
+						*lpcbData = needed;
+						te::sdk::helper::logging::Log("[#TE FZ] RegQueryValueExA spoofed ProcessorNameString -> %s", g_spoof.cpuBrand);
+					}
+				}
+			}
+		}
+		return result;
+	}
+
+	// Install HWID spoofing hooks (called after MinHook is initialized)
+	static bool InstallHWIDSpoofHooks()
+	{
+		InitSpoofedHWID();
+
+		HMODULE hKernel32 = ::GetModuleHandleA("kernel32.dll");
+		HMODULE hUser32 = ::GetModuleHandleA("user32.dll");
+		HMODULE hAdvapi32 = ::LoadLibraryA("advapi32.dll");
+
+		bool success = true;
+		int count = 0;
+
+		// P0: Drive serial
+		if (hKernel32) {
+			success &= InstallHook(::GetProcAddress(hKernel32, "GetVolumeInformationA"),
+				reinterpret_cast<LPVOID>(Hooked_GetVolumeInformationA),
+				reinterpret_cast<LPVOID*>(&o_GetVolumeInformationA), "GetVolumeInformationA");
+			count++;
+
+			success &= InstallHook(::GetProcAddress(hKernel32, "DeviceIoControl"),
+				reinterpret_cast<LPVOID>(Hooked_DeviceIoControl),
+				reinterpret_cast<LPVOID*>(&o_DeviceIoControl), "DeviceIoControl");
+			count++;
+
+			success &= InstallHook(::GetProcAddress(hKernel32, "GlobalMemoryStatusEx"),
+				reinterpret_cast<LPVOID>(Hooked_GlobalMemoryStatusEx),
+				reinterpret_cast<LPVOID*>(&o_GlobalMemoryStatusEx), "GlobalMemoryStatusEx");
+			count++;
+
+			success &= InstallHook(::GetProcAddress(hKernel32, "GetSystemInfo"),
+				reinterpret_cast<LPVOID>(Hooked_GetSystemInfo),
+				reinterpret_cast<LPVOID*>(&o_GetSystemInfo), "GetSystemInfo");
+			count++;
+		}
+
+		// P1: Display
+		if (hUser32) {
+			success &= InstallHook(::GetProcAddress(hUser32, "EnumDisplayDevicesA"),
+				reinterpret_cast<LPVOID>(Hooked_EnumDisplayDevicesA),
+				reinterpret_cast<LPVOID*>(&o_EnumDisplayDevicesA), "EnumDisplayDevicesA");
+			count++;
+
+			success &= InstallHook(::GetProcAddress(hUser32, "GetKeyboardType"),
+				reinterpret_cast<LPVOID>(Hooked_GetKeyboardType),
+				reinterpret_cast<LPVOID*>(&o_GetKeyboardType), "GetKeyboardType");
+			count++;
+		}
+
+		// P2: Registry CPU info
+		if (hAdvapi32) {
+			success &= InstallHook(::GetProcAddress(hAdvapi32, "RegQueryValueExA"),
+				reinterpret_cast<LPVOID>(Hooked_RegQueryValueExA),
+				reinterpret_cast<LPVOID*>(&o_RegQueryValueExA), "RegQueryValueExA");
+			count++;
+		}
+
+		te::sdk::helper::logging::Log("[#TE FZ] HWID spoof hooks: %d installed, success=%d", count, success);
+		return success;
+	}
+
 	// ---------- FenixZone Internal Function Hooks ----------
 
 	// Known FenixZone function signatures
@@ -1022,8 +1326,10 @@ namespace te::rce::fz::bypass
 
 	static bool IsSpoofableCommand(const std::string& line)
 	{
-		std::regex pattern(R"(\/(buto|quto).*?0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8}.*0x[0-9A-Fa-f]{8})");
-		return std::regex_search(line, pattern);
+		// Only spoof HWID report commands (CLA/DRA/MON), not plain /buto hex tokens
+		return line.find("/buto CLA:") != std::string::npos ||
+		       line.find("/buto DRA:") != std::string::npos ||
+		       line.find("/quto MON:") != std::string::npos;
 	}
 
 	static std::string ReplaceHexWithRandom(const std::string& input)
@@ -1043,6 +1349,17 @@ namespace te::rce::fz::bypass
 		return result;
 	}
 
+	static std::string RandomDRA()
+	{
+		static const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+		const int length = 15;
+		std::string result = "dRA";
+		for (int i = 0; i < length; i++) {
+			result += charset[rand() % (sizeof(charset) - 1)];
+		}
+		return result;
+	}
+
 	static std::string SpoofCommandHWData(const std::string& input)
 	{
 		try
@@ -1051,6 +1368,11 @@ namespace te::rce::fz::bypass
 				return input;
 
 			std::string output = input;
+
+			// Spoof DRA identifier (must start with "dRA")
+			output = std::regex_replace(output,
+				std::regex(R"(\bdRA[A-Za-z0-9]{10,20}\b)"),
+				RandomDRA());
 
 			// Spoof display device (EnumDisplayDevicesA)
 			output = std::regex_replace(output,
@@ -1094,6 +1416,8 @@ namespace te::rce::fz::bypass
 			// Spoof monitor info
 			output = std::regex_replace(output, std::regex(R"(\b[A-Z]{3}\d{4}\b)"), RandomMonitorID());
 			output = std::regex_replace(output, std::regex(R"(\b\d{3,4}X\d{3,4}\b)"), RandomResolution());
+
+			te::sdk::helper::logging::Log("[#TE FZ] Spoofed hardware identifiers: %s", output.c_str());
 
 			return output;
 		}
@@ -1435,7 +1759,6 @@ namespace te::rce::fz::bypass
 	};
 
 	static std::unordered_set<uintptr_t> g_analyzedBases;
-	static uintptr_t g_fzModuleBase = 0;
 	static FZExportInfo g_fzExports;
 
 	// SEH-protected: find PE module base by walking back from an executable page
@@ -1838,9 +2161,10 @@ namespace te::rce::fz::bypass
 						// Verify FZ module by checking for known exports + reasonable count
 						if (info.sendCommand && info.totalExports > 10) {
 							g_fzModuleBase = base;
+							g_fzModuleSize = GetPESizeOfImage_SEH(base);
 							g_fzExports = info;
-							te::sdk::helper::logging::Log("[#TE FZ] FenixZone module confirmed at 0x%08X (%d exports)",
-								(uint32_t)base, info.totalExports);
+							te::sdk::helper::logging::Log("[#TE FZ] FenixZone module confirmed at 0x%08X size=0x%X (%d exports)",
+								(uint32_t)base, (uint32_t)g_fzModuleSize, info.totalExports);
 							break;
 						}
 					}
@@ -1907,8 +2231,6 @@ namespace te::rce::fz::bypass
 					(uint32_t)g_chatPushCandidate, attempt);
 				if (HookChatPushAt(g_chatPushCandidate)) {
 					g_fzInternalHooked = true;
-					//SimulateVirtualProtectPatch();
-					//Init_CreateThreadPatch();
 					te::sdk::helper::logging::Log("[#TE FZ] FenixZone bypassed (behavioral analysis)!");
 					te::sdk::helper::samp::AddChatMessage(
 						"[#TE] FenixZone Anti-Cheat bypassed !",
