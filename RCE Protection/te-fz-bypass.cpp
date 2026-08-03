@@ -155,6 +155,7 @@ namespace te::rce::fz::bypass
 		if (FindStringInData(peData, "159.223.98.10"))               score += 10;
 		if (FindStringInData(peData, "192.95.30.92"))                score += 10;
 		if (FindStringInData(peData, "24.152.36.102"))               score += 10;
+		if (FindStringInData(peData, "24.144.65.222"))               score += 10; // cn3.dll download server
 		if (FindStringInData(peData, "gta:puta@"))                   score += 10;
 
 		// --- Tier 5: Payload filenames (5 pts each) ---
@@ -162,9 +163,11 @@ namespace te::rce::fz::bypass
 		if (FindStringInData(peData, "ac-v2.dll"))                   score += 5;
 		if (FindStringInData(peData, "nz.dll"))                      score += 5;
 		if (FindStringInData(peData, "cn2.dll"))                     score += 5;
+		if (FindStringInData(peData, "cn3.dll"))                     score += 5; // new hooking payload (SA-MP SDK + hooking library)
 		if (FindStringInData(peData, "anti-key.asi"))                score += 5;
 		if (FindStringInData(peData, "anti-crashermx.asi"))          score += 5;
 		if (FindStringInData(peData, "Anticheat%d.tmp"))             score += 5;
+		if (FindStringInData(peData, "acokvbokazaa.tmp"))            score += 5; // new temp file name
 
 		// --- Tier 6: GCC/MinGW prologue check (5 pts) ---
 		// FZ is always compiled with GCC (55 89 E5 pattern)
@@ -179,8 +182,26 @@ namespace te::rce::fz::bypass
 		uint8_t sigChat[] = { 0x55, 0x89, 0xE5, 0x53, 0x89, 0xC3, 0x83, 0xEC, 0x14, 0xE8 };
 		if (FindBytesInData(peData, reinterpret_cast<const char*>(sigChat), 10)) score += 5;
 
-		// Obfuscated section name ".Jz?" (very unique)
+		// Obfuscated section name ".Jz?" (older FZ versions)
 		if (FindStringInData(peData, ".Jz?"))                        score += 10;
+		// Custom code section ".JI" (FZ v1.0 dump: 6C649000-6C68EBFF, 279 KB, R-X)
+		if (FindStringInData(peData, ".JI"))                         score += 10;
+
+		// --- Tier 8: SAMP version dispatcher signatures (5 pts each) ---
+		// FUN_6C60E898 reads a struct at 0x278CDDA0 and selects a dispatch index
+		// by comparing these known 32-bit signatures at +0x120 and +0x128
+		uint8_t dispSig0[] = { 0xAB, 0xAC, 0x94, 0x60 }; // 0x6094ACAB
+		uint8_t dispSig1[] = { 0x43, 0x42, 0x0B, 0x5C }; // 0x5C0B4243
+		uint8_t dispSig2[] = { 0xCD, 0x06, 0xD6, 0x5D }; // 0x5DD606CD
+		uint8_t dispSig3[] = { 0x9E, 0xC3, 0x72, 0x63 }; // 0x6372C39E
+		uint8_t dispSig4[] = { 0x7A, 0xF4, 0x42, 0x55 }; // 0x5542F47A
+		uint8_t dispSig5[] = { 0x94, 0x0C, 0xC3, 0x59 }; // 0x59C30C94
+		if (FindBytesInData(peData, reinterpret_cast<const char*>(dispSig0), 4)) score += 5;
+		if (FindBytesInData(peData, reinterpret_cast<const char*>(dispSig1), 4)) score += 5;
+		if (FindBytesInData(peData, reinterpret_cast<const char*>(dispSig2), 4)) score += 5;
+		if (FindBytesInData(peData, reinterpret_cast<const char*>(dispSig3), 4)) score += 5;
+		if (FindBytesInData(peData, reinterpret_cast<const char*>(dispSig4), 4)) score += 5;
+		if (FindBytesInData(peData, reinterpret_cast<const char*>(dispSig5), 4)) score += 5;
 
 		// Animation strings used by FZ cheats
 		if (FindStringInData(peData, "skate_run"))                   score += 5;
@@ -1913,7 +1934,7 @@ namespace te::rce::fz::bypass
 			}
 			if (zeroCount >= 14) return FALSE;
 
-			// JMP trampoline = code is present (export stub redirecting to .Jz?)
+			// JMP trampoline = code is present (export stub redirecting to .Jz? or .JI)
 			if (p[0] == 0xE9) return TRUE;
 			if (p[0] == 0xFF && p[1] == 0x25) return TRUE;
 
@@ -2179,7 +2200,7 @@ namespace te::rce::fz::bypass
 				uintptr_t sendCmdAddr = g_fzExports.sendCommand;
 
 				if (sendCmdAddr && IsCodeReady_SEH(sendCmdAddr)) {
-					// Follow JMP chains: export stub in .text may redirect to real code in .Jz?
+					// Follow JMP chains: export stub in .text may redirect to real code in .Jz? or .JI
 					uintptr_t hookTarget = FollowJmpChain_SEH(sendCmdAddr, 5);
 					if (hookTarget && hookTarget != sendCmdAddr) {
 						te::sdk::helper::logging::Log("[#TE FZ] SendCommand 0x%08X -> JMP chain -> 0x%08X",
